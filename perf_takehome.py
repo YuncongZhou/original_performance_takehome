@@ -1444,40 +1444,43 @@ class KernelBuilder:
 
         skip_wrap_check: If True, skip the comparison and masking (saves 3 instructions per group).
                         Use this for rounds where idx is guaranteed to stay < n_nodes.
+
+        Optimized formula: new_idx = old_idx * 2 + 1 + (val & 1)
+        Using multiply_add: tmp = multiply_add(idx, 2, 1) = idx*2+1, then tmp + (val&1)
         """
-        # Use v_tmp1[0:4] + v_tmp2[0:2] if available for 6-at-a-time processing
-        # new_idx = old_idx * 2 + (val & 1) + 1
+        # new_idx = old_idx * 2 + (val & 1) + 1 = multiply_add(idx, 2, 1) + (val & 1)
         # if new_idx >= n_nodes: new_idx = 0
         for vi in range(0, n_vectors, 6):
             vecs = min(6, n_vectors - vi)
             if vecs == 6 and v_tmp2 is not None:
                 # Process 6 vectors using v_tmp1[0:4] + v_tmp2[0:2] as temps
                 temps = [v_tmp1[0], v_tmp1[1], v_tmp1[2], v_tmp1[3], v_tmp2[0], v_tmp2[1]]
-                # Step 1: & and * for vecs 0-2
+                # Step 1: multiply_add(idx, 2, 1) for 0-2, & for bits 3-5
                 self.instrs.append({
-                    "valu": [("&", temps[0], all_val[vi], v_one),
-                             ("*", all_idx[vi], all_idx[vi], v_two),
-                             ("&", temps[1], all_val[vi+1], v_one),
-                             ("*", all_idx[vi+1], all_idx[vi+1], v_two),
-                             ("&", temps[2], all_val[vi+2], v_one),
-                             ("*", all_idx[vi+2], all_idx[vi+2], v_two)]
-                })
-                # Step 2: & and * for vecs 3-5
-                self.instrs.append({
-                    "valu": [("&", temps[3], all_val[vi+3], v_one),
-                             ("*", all_idx[vi+3], all_idx[vi+3], v_two),
+                    "valu": [("multiply_add", temps[0], all_idx[vi], v_two, v_one),
+                             ("multiply_add", temps[1], all_idx[vi+1], v_two, v_one),
+                             ("multiply_add", temps[2], all_idx[vi+2], v_two, v_one),
+                             ("&", temps[3], all_val[vi+3], v_one),
                              ("&", temps[4], all_val[vi+4], v_one),
-                             ("*", all_idx[vi+4], all_idx[vi+4], v_two),
-                             ("&", temps[5], all_val[vi+5], v_one),
-                             ("*", all_idx[vi+5], all_idx[vi+5], v_two)]
+                             ("&", temps[5], all_val[vi+5], v_one)]
                 })
-                # Step 3: + for all 6 temps
+                # Step 2: multiply_add for 3-5, & for bits 0-2
                 self.instrs.append({
-                    "valu": [("+", temps[j], temps[j], v_one) for j in range(6)]
+                    "valu": [("multiply_add", all_idx[vi+3], all_idx[vi+3], v_two, v_one),
+                             ("multiply_add", all_idx[vi+4], all_idx[vi+4], v_two, v_one),
+                             ("multiply_add", all_idx[vi+5], all_idx[vi+5], v_two, v_one),
+                             ("&", all_idx[vi], all_val[vi], v_one),
+                             ("&", all_idx[vi+1], all_val[vi+1], v_one),
+                             ("&", all_idx[vi+2], all_val[vi+2], v_one)]
                 })
-                # Step 4: + for all 6 indices
+                # Step 3: + for indices 0-5 (add bit to shifted idx)
                 self.instrs.append({
-                    "valu": [("+", all_idx[vi+j], all_idx[vi+j], temps[j]) for j in range(6)]
+                    "valu": [("+", all_idx[vi], temps[0], all_idx[vi]),
+                             ("+", all_idx[vi+1], temps[1], all_idx[vi+1]),
+                             ("+", all_idx[vi+2], temps[2], all_idx[vi+2]),
+                             ("+", all_idx[vi+3], all_idx[vi+3], temps[3]),
+                             ("+", all_idx[vi+4], all_idx[vi+4], temps[4]),
+                             ("+", all_idx[vi+5], all_idx[vi+5], temps[5])]
                 })
                 if not skip_wrap_check:
                     self.instrs.append({
