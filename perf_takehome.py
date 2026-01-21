@@ -845,6 +845,10 @@ class KernelBuilder:
         # Swap between address buffers: even groups use v_addrs, odd groups use v_addrs2
         addr_bufs = [v_addrs, v_addrs2]
 
+        # Track pending Index B from previous group
+        pending_index_b = False
+        prev_g = 0
+
         for group_idx in range(n_groups):
             g = group_idx * 4
             cur_addrs = addr_bufs[group_idx % 2]
@@ -852,7 +856,7 @@ class KernelBuilder:
             has_next_group = (group_idx < n_groups - 1)
             ng = g + 4  # next group start
 
-            # Compute addresses for current group (except first iteration of subsequent groups)
+            # Compute addresses for current group (only for group 0)
             if group_idx == 0:
                 # First group: compute addresses normally
                 self.instrs.append({
@@ -866,14 +870,67 @@ class KernelBuilder:
                 self.instrs.append({
                     "alu": [("+", cur_addrs[3] + vi, fp, all_idx[g + 3] + vi) for vi in range(8)]
                 })
-            # For subsequent groups, addresses were pre-computed in previous group's Index B
 
-            # Gather A (vec 0,1)
-            for vi in range(VLEN):
+            # Gather A (vec 0,1) - overlap with prev Index B if pending
+            if pending_index_b and not skip_index:
+                # Overlap Gather A with prev group's Index B
+                pg = prev_g  # previous group start
+                # 8 loads, 6 Index B instructions - overlap first 6 loads with Index B
                 self.instrs.append({
-                    "load": [("load", v_node[0] + vi, cur_addrs[0] + vi),
-                             ("load", v_node[1] + vi, cur_addrs[1] + vi)]
+                    "load": [("load", v_node[0] + 0, cur_addrs[0] + 0),
+                             ("load", v_node[1] + 0, cur_addrs[1] + 0)],
+                    "valu": [("&", v_tmp1[2], all_val[pg + 2], v_one),
+                             ("*", all_idx[pg + 2], all_idx[pg + 2], v_two),
+                             ("&", v_tmp1[3], all_val[pg + 3], v_one),
+                             ("*", all_idx[pg + 3], all_idx[pg + 3], v_two)]
                 })
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 1, cur_addrs[0] + 1),
+                             ("load", v_node[1] + 1, cur_addrs[1] + 1)],
+                    "valu": [("+", v_tmp1[2], v_tmp1[2], v_one),
+                             ("+", v_tmp1[3], v_tmp1[3], v_one)]
+                })
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 2, cur_addrs[0] + 2),
+                             ("load", v_node[1] + 2, cur_addrs[1] + 2)],
+                    "valu": [("+", all_idx[pg + 2], all_idx[pg + 2], v_tmp1[2]),
+                             ("+", all_idx[pg + 3], all_idx[pg + 3], v_tmp1[3])]
+                })
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 3, cur_addrs[0] + 3),
+                             ("load", v_node[1] + 3, cur_addrs[1] + 3)],
+                    "valu": [("<", v_tmp1[2], all_idx[pg + 2], v_n_nodes),
+                             ("<", v_tmp1[3], all_idx[pg + 3], v_n_nodes)]
+                })
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 4, cur_addrs[0] + 4),
+                             ("load", v_node[1] + 4, cur_addrs[1] + 4)],
+                    "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
+                             ("-", v_tmp1[3], v_zero, v_tmp1[3])]
+                })
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 5, cur_addrs[0] + 5),
+                             ("load", v_node[1] + 5, cur_addrs[1] + 5)],
+                    "valu": [("&", all_idx[pg + 2], all_idx[pg + 2], v_tmp1[2]),
+                             ("&", all_idx[pg + 3], all_idx[pg + 3], v_tmp1[3])]
+                })
+                # Remaining loads (no more Index B ops)
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 6, cur_addrs[0] + 6),
+                             ("load", v_node[1] + 6, cur_addrs[1] + 6)]
+                })
+                self.instrs.append({
+                    "load": [("load", v_node[0] + 7, cur_addrs[0] + 7),
+                             ("load", v_node[1] + 7, cur_addrs[1] + 7)]
+                })
+                pending_index_b = False
+            else:
+                # Normal Gather A (no overlap)
+                for vi in range(VLEN):
+                    self.instrs.append({
+                        "load": [("load", v_node[0] + vi, cur_addrs[0] + vi),
+                                 ("load", v_node[1] + vi, cur_addrs[1] + vi)]
+                    })
 
             # XOR A
             self.instrs.append({
@@ -938,17 +995,44 @@ class KernelBuilder:
                 const1_vec, const3_vec = hash_const_vecs[hi]
 
                 if skip_index:
-                    # Skip index operations on last round
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
-                    })
+                    # Skip index operations on last round, but still compute addresses for next group
+                    if hi == 4 and has_next_group:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
+                            "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)]
+                        })
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
+                            "alu": [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(8)]
+                        })
+                    elif hi == 5 and has_next_group:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
+                            "alu": [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
+                        })
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
+                            "alu": [("+", next_addrs[3] + vi, fp, all_idx[ng + 3] + vi) for vi in range(8)]
+                        })
+                    else:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
+                        })
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
+                        })
                 elif hi == 0:
                     self.instrs.append({
                         "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
@@ -1007,6 +1091,34 @@ class KernelBuilder:
                         "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
                                  (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
                     })
+                elif hi == 4 and has_next_group:
+                    # Stage 4: add address computation for next group vectors 0,1
+                    self.instrs.append({
+                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
+                        "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)]
+                    })
+                    self.instrs.append({
+                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
+                        "alu": [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(8)]
+                    })
+                elif hi == 5 and has_next_group:
+                    # Stage 5: add address computation for next group vectors 2,3
+                    self.instrs.append({
+                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
+                        "alu": [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
+                    })
+                    self.instrs.append({
+                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
+                        "alu": [("+", next_addrs[3] + vi, fp, all_idx[ng + 3] + vi) for vi in range(8)]
+                    })
                 else:
                     self.instrs.append({
                         "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
@@ -1019,58 +1131,16 @@ class KernelBuilder:
                                  (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
                     })
 
-            # Index B - overlapped with next group's address computation (skip on last round)
+            # Index B - deferred to overlap with next group's Gather A (skip on last round)
             if skip_index:
-                # Skip Index B on last round, but still compute next group addresses if needed
-                if has_next_group:
-                    # Just compute next group's addresses without Index B
-                    self.instrs.append({
-                        "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)]
-                    })
-                    self.instrs.append({
-                        "alu": [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(8)]
-                    })
-                    self.instrs.append({
-                        "alu": [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
-                    })
-                    self.instrs.append({
-                        "alu": [("+", next_addrs[3] + vi, fp, all_idx[ng + 3] + vi) for vi in range(8)]
-                    })
-                # No Index B for last round
+                # Skip Index B on last round
+                pass
             elif has_next_group:
-                # Overlap Index B (VALU) with next group's address computation (ALU)
-                self.instrs.append({
-                    "valu": [("&", v_tmp1[2], all_val[g + 2], v_one),
-                             ("*", all_idx[g + 2], all_idx[g + 2], v_two),
-                             ("&", v_tmp1[3], all_val[g + 3], v_one),
-                             ("*", all_idx[g + 3], all_idx[g + 3], v_two)],
-                    "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)]
-                })
-                self.instrs.append({
-                    "valu": [("+", v_tmp1[2], v_tmp1[2], v_one),
-                             ("+", v_tmp1[3], v_tmp1[3], v_one)],
-                    "alu": [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(8)]
-                })
-                self.instrs.append({
-                    "valu": [("+", all_idx[g + 2], all_idx[g + 2], v_tmp1[2]),
-                             ("+", all_idx[g + 3], all_idx[g + 3], v_tmp1[3])],
-                    "alu": [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
-                })
-                self.instrs.append({
-                    "valu": [("<", v_tmp1[2], all_idx[g + 2], v_n_nodes),
-                             ("<", v_tmp1[3], all_idx[g + 3], v_n_nodes)],
-                    "alu": [("+", next_addrs[3] + vi, fp, all_idx[ng + 3] + vi) for vi in range(8)]
-                })
-                self.instrs.append({
-                    "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
-                             ("-", v_tmp1[3], v_zero, v_tmp1[3])]
-                })
-                self.instrs.append({
-                    "valu": [("&", all_idx[g + 2], all_idx[g + 2], v_tmp1[2]),
-                             ("&", all_idx[g + 3], all_idx[g + 3], v_tmp1[3])]
-                })
+                # Defer Index B to overlap with next group's Gather A
+                pending_index_b = True
+                prev_g = g
             else:
-                # Last group: no next group to precompute
+                # Last group: execute Index B now (no next group to overlap with)
                 self.instrs.append({
                     "valu": [("&", v_tmp1[2], all_val[g + 2], v_one),
                              ("*", all_idx[g + 2], all_idx[g + 2], v_two),
