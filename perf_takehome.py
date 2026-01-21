@@ -223,42 +223,106 @@ class KernelBuilder:
                 ]
             })
 
-        # Load node values (2 loads per cycle, 4 cycles per vector, 16 cycles total)
-        for vi in range(0, VLEN, 2):
-            for u in range(UNROLL):
-                self.instrs.append({
-                    "load": [
-                        ("load", v_node_val[u] + vi, v_addrs[u] + vi),
-                        ("load", v_node_val[u] + vi + 1, v_addrs[u] + vi + 1),
-                    ]
-                })
+        # ====== INTERLEAVED LOAD + COMPUTE SCHEDULE ======
+        # Group A = vectors 0,1; Group B = vectors 2,3
+        # Load Group A's node values first, then overlap Group B loads with Group A computation
 
-        # XOR for all vectors (can do up to 6 per cycle)
-        for u in range(0, UNROLL, 6):
-            end = min(u + 6, UNROLL)
+        # Load node values for Group A (vectors 0,1): 8 loads = 4 cycles
+        for vi in range(0, VLEN, 2):
             self.instrs.append({
-                "valu": [("^", v_val[i], v_val[i], v_node_val[i]) for i in range(u, end)]
+                "load": [
+                    ("load", v_node_val[0] + vi, v_addrs[0] + vi),
+                    ("load", v_node_val[0] + vi + 1, v_addrs[0] + vi + 1),
+                ]
+            })
+        for vi in range(0, VLEN, 2):
+            self.instrs.append({
+                "load": [
+                    ("load", v_node_val[1] + vi, v_addrs[1] + vi),
+                    ("load", v_node_val[1] + vi + 1, v_addrs[1] + vi + 1),
+                ]
             })
 
-        # Hash stages - split 4 vectors into 2 groups of 2 to fit 6 valu slots
+        # XOR for Group A
+        self.instrs.append({
+            "valu": [("^", v_val[0], v_val[0], v_node_val[0]),
+                     ("^", v_val[1], v_val[1], v_node_val[1])]
+        })
+
+        # Interleaved: Hash Group A while loading Group B
+        # Group B needs 8 load pairs: 4 for vec2, 4 for vec3
+        load_pair_idx = 0  # 0-7 for the 8 load pairs
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             const1_vec, const3_vec = hash_const_vecs[hi]
-            # First half (vectors 0,1)
-            valu_ops = []
-            for u in range(0, 2):
-                valu_ops.append((op1, v_tmp1[u], v_val[u], const1_vec))
-                valu_ops.append((op3, v_tmp2[u], v_val[u], const3_vec))
+
+            # Hash stage first ops for Group A (vectors 0,1) - 4 valu ops
+            valu_ops = [(op1, v_tmp1[0], v_val[0], const1_vec),
+                        (op3, v_tmp2[0], v_val[0], const3_vec),
+                        (op1, v_tmp1[1], v_val[1], const1_vec),
+                        (op3, v_tmp2[1], v_val[1], const3_vec)]
+
+            # Try to add Group B loads in same cycle
+            if load_pair_idx < 8:
+                vec_idx = 2 + (load_pair_idx // 4)  # 0-3 -> vec 2, 4-7 -> vec 3
+                vi = (load_pair_idx % 4) * 2  # 0,2,4,6
+                self.instrs.append({
+                    "valu": valu_ops,
+                    "load": [
+                        ("load", v_node_val[vec_idx] + vi, v_addrs[vec_idx] + vi),
+                        ("load", v_node_val[vec_idx] + vi + 1, v_addrs[vec_idx] + vi + 1),
+                    ]
+                })
+                load_pair_idx += 1
+            else:
+                self.instrs.append({"valu": valu_ops})
+
+            # Hash stage combine for Group A (vectors 0,1) - 2 valu ops
+            valu_ops = [(op2, v_val[0], v_tmp1[0], v_tmp2[0]),
+                        (op2, v_val[1], v_tmp1[1], v_tmp2[1])]
+
+            # Try to add Group B loads in same cycle
+            if load_pair_idx < 8:
+                vec_idx = 2 + (load_pair_idx // 4)
+                vi = (load_pair_idx % 4) * 2
+                self.instrs.append({
+                    "valu": valu_ops,
+                    "load": [
+                        ("load", v_node_val[vec_idx] + vi, v_addrs[vec_idx] + vi),
+                        ("load", v_node_val[vec_idx] + vi + 1, v_addrs[vec_idx] + vi + 1),
+                    ]
+                })
+                load_pair_idx += 1
+            else:
+                self.instrs.append({"valu": valu_ops})
+
+        # Finish any remaining Group B loads
+        while load_pair_idx < 8:
+            vec_idx = 2 + (load_pair_idx // 4)
+            vi = (load_pair_idx % 4) * 2
+            self.instrs.append({
+                "load": [
+                    ("load", v_node_val[vec_idx] + vi, v_addrs[vec_idx] + vi),
+                    ("load", v_node_val[vec_idx] + vi + 1, v_addrs[vec_idx] + vi + 1),
+                ]
+            })
+            load_pair_idx += 1
+
+        # XOR for Group B
+        self.instrs.append({
+            "valu": [("^", v_val[2], v_val[2], v_node_val[2]),
+                     ("^", v_val[3], v_val[3], v_node_val[3])]
+        })
+
+        # Hash Group B (vectors 2,3)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            const1_vec, const3_vec = hash_const_vecs[hi]
+            valu_ops = [(op1, v_tmp1[2], v_val[2], const1_vec),
+                        (op3, v_tmp2[2], v_val[2], const3_vec),
+                        (op1, v_tmp1[3], v_val[3], const1_vec),
+                        (op3, v_tmp2[3], v_val[3], const3_vec)]
             self.instrs.append({"valu": valu_ops})
-            # Second half (vectors 2,3)
-            valu_ops = []
-            for u in range(2, 4):
-                valu_ops.append((op1, v_tmp1[u], v_val[u], const1_vec))
-                valu_ops.append((op3, v_tmp2[u], v_val[u], const3_vec))
-            self.instrs.append({"valu": valu_ops})
-            # Combine for all 4 vectors (4 ops, fits in 1 cycle)
-            valu_ops = []
-            for u in range(UNROLL):
-                valu_ops.append((op2, v_val[u], v_tmp1[u], v_tmp2[u]))
+            valu_ops = [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                        (op2, v_val[3], v_tmp1[3], v_tmp2[3])]
             self.instrs.append({"valu": valu_ops})
 
         # Index update: idx = 2*idx + (val&1) + 1
