@@ -352,87 +352,158 @@ class KernelBuilder:
                      ("^", v_val[3], v_val[3], v_node_val[3])]
         })
 
-        # Hash Group B (vectors 2,3)
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            const1_vec, const3_vec = hash_const_vecs[hi]
-            valu_ops = [(op1, v_tmp1[2], v_val[2], const1_vec),
-                        (op3, v_tmp2[2], v_val[2], const3_vec),
-                        (op1, v_tmp1[3], v_val[3], const1_vec),
-                        (op3, v_tmp2[3], v_val[3], const3_vec)]
-            self.instrs.append({"valu": valu_ops})
-            valu_ops = [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
-                        (op2, v_val[3], v_tmp1[3], v_tmp2[3])]
-            self.instrs.append({"valu": valu_ops})
+        # ====== INTERLEAVED: Group B Hash + Group A Index Update ======
+        # Group A hash is complete, so we can do Group A index update
+        # while Group B hash is running (no data dependencies)
 
-        # Index update: idx = 2*idx + (val&1) + 1
-        valu_ops = []
-        for u in range(0, 2):
-            valu_ops.append(("&", v_tmp1[u], v_val[u], v_one))
-            valu_ops.append(("*", v_idx[u], v_idx[u], v_two))
-        self.instrs.append({"valu": valu_ops})
-        valu_ops = []
-        for u in range(2, 4):
-            valu_ops.append(("&", v_tmp1[u], v_val[u], v_one))
-            valu_ops.append(("*", v_idx[u], v_idx[u], v_two))
-        self.instrs.append({"valu": valu_ops})
-
-        valu_ops = []
-        for u in range(UNROLL):
-            valu_ops.append(("+", v_tmp1[u], v_tmp1[u], v_one))
-        self.instrs.append({"valu": valu_ops})
-
-        valu_ops = []
-        for u in range(UNROLL):
-            valu_ops.append(("+", v_idx[u], v_idx[u], v_tmp1[u]))
-        self.instrs.append({"valu": valu_ops})
-
-        # Bounds check: mask = -(idx < n_nodes), idx &= mask
-        valu_ops = []
-        for u in range(UNROLL):
-            valu_ops.append(("<", v_tmp1[u], v_idx[u], v_n_nodes))
-        self.instrs.append({"valu": valu_ops})
-
-        valu_ops = []
-        for u in range(UNROLL):
-            valu_ops.append(("-", v_tmp1[u], v_zero, v_tmp1[u]))
-        self.instrs.append({"valu": valu_ops})
-
-        valu_ops = []
-        for u in range(UNROLL):
-            valu_ops.append(("&", v_idx[u], v_idx[u], v_tmp1[u]))
-        self.instrs.append({"valu": valu_ops})
-
-        # Store results + update loop counter (overlap store with ALU)
-        # First store
+        # Hash B stage 0 + Group A idx prep (&, *)
+        const1_vec, const3_vec = hash_const_vecs[0]
+        op1, val1, op2, op3, val3 = HASH_STAGES[0]
         self.instrs.append({
+            "valu": [(op1, v_tmp1[2], v_val[2], const1_vec),
+                     (op3, v_tmp2[2], v_val[2], const3_vec),
+                     (op1, v_tmp1[3], v_val[3], const1_vec),
+                     (op3, v_tmp2[3], v_val[3], const3_vec),
+                     ("&", v_node_val[0], v_val[0], v_one),
+                     ("*", v_idx[0], v_idx[0], v_two)]
+        })
+        self.instrs.append({
+            "valu": [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                     (op2, v_val[3], v_tmp1[3], v_tmp2[3]),
+                     ("&", v_node_val[1], v_val[1], v_one),
+                     ("*", v_idx[1], v_idx[1], v_two)]
+        })
+
+        # Hash B stage 1 + Group A idx finish (+1, add)
+        const1_vec, const3_vec = hash_const_vecs[1]
+        op1, val1, op2, op3, val3 = HASH_STAGES[1]
+        self.instrs.append({
+            "valu": [(op1, v_tmp1[2], v_val[2], const1_vec),
+                     (op3, v_tmp2[2], v_val[2], const3_vec),
+                     (op1, v_tmp1[3], v_val[3], const1_vec),
+                     (op3, v_tmp2[3], v_val[3], const3_vec),
+                     ("+", v_node_val[0], v_node_val[0], v_one),
+                     ("+", v_node_val[1], v_node_val[1], v_one)]
+        })
+        self.instrs.append({
+            "valu": [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                     (op2, v_val[3], v_tmp1[3], v_tmp2[3]),
+                     ("+", v_idx[0], v_idx[0], v_node_val[0]),
+                     ("+", v_idx[1], v_idx[1], v_node_val[1])]
+        })
+
+        # Hash B stage 2 + Group A bounds check
+        const1_vec, const3_vec = hash_const_vecs[2]
+        op1, val1, op2, op3, val3 = HASH_STAGES[2]
+        self.instrs.append({
+            "valu": [(op1, v_tmp1[2], v_val[2], const1_vec),
+                     (op3, v_tmp2[2], v_val[2], const3_vec),
+                     (op1, v_tmp1[3], v_val[3], const1_vec),
+                     (op3, v_tmp2[3], v_val[3], const3_vec),
+                     ("<", v_node_val[0], v_idx[0], v_n_nodes),
+                     ("<", v_node_val[1], v_idx[1], v_n_nodes)]
+        })
+        self.instrs.append({
+            "valu": [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                     (op2, v_val[3], v_tmp1[3], v_tmp2[3]),
+                     ("-", v_node_val[0], v_zero, v_node_val[0]),
+                     ("-", v_node_val[1], v_zero, v_node_val[1])]
+        })
+
+        # Hash B stage 3 + Group A idx mask
+        const1_vec, const3_vec = hash_const_vecs[3]
+        op1, val1, op2, op3, val3 = HASH_STAGES[3]
+        self.instrs.append({
+            "valu": [(op1, v_tmp1[2], v_val[2], const1_vec),
+                     (op3, v_tmp2[2], v_val[2], const3_vec),
+                     (op1, v_tmp1[3], v_val[3], const1_vec),
+                     (op3, v_tmp2[3], v_val[3], const3_vec),
+                     ("&", v_idx[0], v_idx[0], v_node_val[0]),
+                     ("&", v_idx[1], v_idx[1], v_node_val[1])]
+        })
+        self.instrs.append({
+            "valu": [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                     (op2, v_val[3], v_tmp1[3], v_tmp2[3])]
+        })
+
+        # Hash B stages 4-5 (no more Group A work to interleave)
+        for hi in range(4, 6):
+            const1_vec, const3_vec = hash_const_vecs[hi]
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+            self.instrs.append({
+                "valu": [(op1, v_tmp1[2], v_val[2], const1_vec),
+                         (op3, v_tmp2[2], v_val[2], const3_vec),
+                         (op1, v_tmp1[3], v_val[3], const1_vec),
+                         (op3, v_tmp2[3], v_val[3], const3_vec)]
+            })
+            self.instrs.append({
+                "valu": [(op2, v_val[2], v_tmp1[2], v_tmp2[2]),
+                         (op2, v_val[3], v_tmp1[3], v_tmp2[3])]
+            })
+
+        # ====== INTERLEAVED: Group B Index Update + Group A Stores ======
+        # Group A is fully ready, store while doing Group B index update
+
+        # Group B idx prep (&, *) + Store Group A val
+        self.instrs.append({
+            "valu": [("&", v_tmp1[2], v_val[2], v_one),
+                     ("*", v_idx[2], v_idx[2], v_two),
+                     ("&", v_tmp1[3], v_val[3], v_one),
+                     ("*", v_idx[3], v_idx[3], v_two)],
             "store": [
-                ("vstore", idx_base[0], v_idx[0]),
                 ("vstore", val_base[0], v_val[0]),
+                ("vstore", val_base[1], v_val[1]),
             ],
             "flow": [("add_imm", loop_i, loop_i, 1)]
         })
-        # Second store + compare
+        # Group B idx finish (+1) + Store Group A idx
         self.instrs.append({
+            "valu": [("+", v_tmp1[2], v_tmp1[2], v_one),
+                     ("+", v_tmp1[3], v_tmp1[3], v_one)],
             "store": [
+                ("vstore", idx_base[0], v_idx[0]),
                 ("vstore", idx_base[1], v_idx[1]),
-                ("vstore", val_base[1], v_val[1]),
             ],
-            "alu": [("<", tmp1, loop_i, n_iters_const)]
+            "alu": [
+                ("*", tmp1, loop_i, vlen_stride),
+                ("<", tmp2, loop_i, n_iters_const),
+            ]
         })
-        # Third store
+        # Group B idx add + next iter base addr prep
+        self.instrs.append({
+            "valu": [("+", v_idx[2], v_idx[2], v_tmp1[2]),
+                     ("+", v_idx[3], v_idx[3], v_tmp1[3])],
+            "alu": [
+                ("+", idx_base[0], self.scratch["inp_indices_p"], tmp1),
+                ("+", val_base[0], self.scratch["inp_values_p"], tmp1),
+            ]
+        })
+
+        # Group B bounds check + Store Group B val
+        self.instrs.append({
+            "valu": [("<", v_tmp1[2], v_idx[2], v_n_nodes),
+                     ("<", v_tmp1[3], v_idx[3], v_n_nodes)],
+            "store": [
+                ("vstore", val_base[2], v_val[2]),
+                ("vstore", val_base[3], v_val[3]),
+            ]
+        })
+        self.instrs.append({
+            "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
+                     ("-", v_tmp1[3], v_zero, v_tmp1[3])]
+        })
+        self.instrs.append({
+            "valu": [("&", v_idx[2], v_idx[2], v_tmp1[2]),
+                     ("&", v_idx[3], v_idx[3], v_tmp1[3])]
+        })
+
+        # Store Group B idx + conditional jump
         self.instrs.append({
             "store": [
                 ("vstore", idx_base[2], v_idx[2]),
-                ("vstore", val_base[2], v_val[2]),
-            ]
-        })
-        # Fourth store + jump
-        self.instrs.append({
-            "store": [
                 ("vstore", idx_base[3], v_idx[3]),
-                ("vstore", val_base[3], v_val[3]),
             ],
-            "flow": [("cond_jump", tmp1, batch_loop_start)]
+            "flow": [("cond_jump", tmp2, batch_loop_start + 2)]
         })
 
         self.instrs.append({"flow": [("add_imm", round_ctr, round_ctr, 1)]})
