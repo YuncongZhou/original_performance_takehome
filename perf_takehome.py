@@ -143,26 +143,28 @@ class KernelBuilder:
             else:
                 effective_round = round_num - 11  # 11->0, 12->1, ..., 15->4
 
+            is_last_round = (round_num == rounds - 1)
+
             if effective_round == 0:
                 # k=1: all indices at 0 (rounds 0 and 11)
                 self._emit_round_single_idx(
                     all_idx, all_val, v_node, v_tmp1, v_tmp2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                    n_vectors, tmp1, idx_value=0
+                    n_vectors, tmp1, idx_value=0, skip_index=is_last_round
                 )
             elif effective_round == 1:
                 # k=2: indices in {1, 2} (rounds 1 and 12)
                 self._emit_round_k2(
                     all_idx, all_val, v_node, v_tmp1, v_tmp2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                    n_vectors, tmp1, tmp2, idx_base=1
+                    n_vectors, tmp1, tmp2, idx_base=1, skip_index=is_last_round
                 )
             else:
                 # Full gather for all other rounds
                 self._emit_round_full_gather(
                     all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                    n_vectors, tmp1
+                    n_vectors, tmp1, skip_index=is_last_round
                 )
 
         # ============ STORE ALL VALUES ============
@@ -175,10 +177,9 @@ class KernelBuilder:
 
     def _emit_round_single_idx(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                                 hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                                n_vectors, tmp1, idx_value):
-        """Emit round with single unique index (rounds 0 and 10)."""
-        # Load single node value - exactly like working baseline for round 0
-        # For idx=0: load directly from forest_values_p (which points to forest[0])
+                                n_vectors, tmp1, idx_value, skip_index=False):
+        """Emit round with single unique index (rounds 0 and 11)."""
+        # Load single node value
         self.add("load", ("load", tmp1, self.scratch["forest_values_p"]))
         self.add("valu", ("vbroadcast", v_node[0], tmp1))
 
@@ -189,15 +190,16 @@ class KernelBuilder:
                          ("^", all_val[vi + 1], all_val[vi + 1], v_node[0])]
             })
 
-        # Hash all vectors (process 3 at a time using 6 valu slots)
+        # Hash all vectors
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
 
-        # Index update all vectors (process 2 at a time)
-        self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
+        # Index update all vectors (skip for last round)
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
 
     def _emit_round_k2(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                        hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                       n_vectors, tmp1, tmp2, idx_base):
+                       n_vectors, tmp1, tmp2, idx_base, skip_index=False):
         """Emit round with k=2 unique indices using VALU-based conditional select.
         Optimized: process 4 vectors at a time using 4 VALU slots."""
         # Load 2 node values: forest[idx_base] and forest[idx_base+1]
@@ -256,13 +258,15 @@ class KernelBuilder:
         # Hash all vectors
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
 
-        # Index update all vectors
-        self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
+        # Index update all vectors (skip for last round)
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
 
-    def _emit_round_k4_batched(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
+    def _emit_round_k4_correct(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                                 hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                                 n_vectors, tmp1, tmp2, idx_base):
-        """Emit round with k=4 unique indices, processing 2 vectors at a time."""
+        """Emit round with k=4 unique indices, processing 1 vector at a time.
+        Uses careful buffer management to avoid corrupting node values."""
         # Load 4 node values
         for i in range(4):
             self.add("load", ("const", tmp1, idx_base + i))
@@ -273,62 +277,47 @@ class KernelBuilder:
         idx_base_vec = self.scratch_const_vec(idx_base)
         v_two_const = self.scratch_const_vec(2)
 
-        # Process 2 vectors at a time to use more VALU slots
-        for vi in range(0, n_vectors, 2):
-            # offset = idx - idx_base (0-3) for both vectors
-            self.instrs.append({
-                "valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec),
-                         ("-", v_tmp1[1], all_idx[vi+1], idx_base_vec)]
-            })
+        # Process 1 vector at a time (simple but correct)
+        for vi in range(n_vectors):
+            # offset = idx - idx_base (0-3)
+            self.instrs.append({"valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec)]})
 
-            # mask1 from bit 1: (offset & 2) >> 1, then negate
-            self.instrs.append({
-                "valu": [("&", v_tmp1[2], v_tmp1[0], v_two_const),
-                         ("&", v_tmp1[3], v_tmp1[1], v_two_const)]
-            })
-            self.instrs.append({
-                "valu": [(">>", v_tmp1[2], v_tmp1[2], v_one),
-                         (">>", v_tmp1[3], v_tmp1[3], v_one)]
-            })
-            self.instrs.append({
-                "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
-                         ("-", v_tmp1[3], v_zero, v_tmp1[3])]
-            })
+            # Level 1: select based on bit 1 (offset & 2)
+            # mask1 = 0 - ((offset & 2) >> 1)
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_two_const)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
 
-            # Select between (n0,n1) and (n2,n3) pairs
-            # diff_02 = n0 ^ n2, diff_13 = n1 ^ n3
+            # diff_02 = n0 ^ n2, diff_13 = n1 ^ n3 (use tmp2)
             self.instrs.append({
                 "valu": [("^", v_tmp2[0], v_node[0], v_node[2]),
                          ("^", v_tmp2[1], v_node[1], v_node[3])]
             })
-            # masked diffs for vec 0
+            # masked diffs
             self.instrs.append({
-                "valu": [("&", v_tmp2[2], v_tmp2[0], v_tmp1[2]),
-                         ("&", v_tmp2[3], v_tmp2[1], v_tmp1[2])]
+                "valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[1]),
+                         ("&", v_tmp2[1], v_tmp2[1], v_tmp1[1])]
             })
-            # sel_low0 = n0 ^ masked_02, sel_high0 = n1 ^ masked_13
+            # sel_low = n0 ^ masked, sel_high = n1 ^ masked (store in tmp2)
             self.instrs.append({
-                "valu": [("^", v_tmp2[2], v_node[0], v_tmp2[2]),
-                         ("^", v_tmp2[3], v_node[1], v_tmp2[3])]
+                "valu": [("^", v_tmp2[0], v_node[0], v_tmp2[0]),
+                         ("^", v_tmp2[1], v_node[1], v_tmp2[1])]
             })
 
-            # Level 2: bit 0 select for vec 0
-            self.instrs.append({"valu": [("&", v_tmp1[2], v_tmp1[0], v_one)]})
-            self.instrs.append({"valu": [("-", v_tmp1[2], v_zero, v_tmp1[2])]})
-            self.instrs.append({"valu": [("^", v_node[0], v_tmp2[2], v_tmp2[3])]})  # diff
-            self.instrs.append({"valu": [("&", v_node[0], v_node[0], v_tmp1[2])]})  # masked
-            self.instrs.append({"valu": [("^", v_node[0], v_tmp2[2], v_node[0])]})  # final for vec0
+            # Level 2: select based on bit 0 (offset & 1)
+            # mask0 = 0 - (offset & 1)
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
 
-            # XOR vec 0
-            self.instrs.append({"valu": [("^", all_val[vi], all_val[vi], v_node[0])]})
+            # diff = sel_low ^ sel_high
+            self.instrs.append({"valu": [("^", v_tmp2[2], v_tmp2[0], v_tmp2[1])]})
+            # masked diff
+            self.instrs.append({"valu": [("&", v_tmp2[2], v_tmp2[2], v_tmp1[1])]})
+            # final = sel_low ^ masked_diff
+            self.instrs.append({"valu": [("^", v_tmp1[2], v_tmp2[0], v_tmp2[2])]})
 
-            # Now vec 1 - masked diffs for vec 1
-            self.instrs.append({
-                "valu": [("^", v_tmp2[0], v_node[0], v_node[2]),  # Reload diff_02
-                         ("^", v_tmp2[1], v_node[1], v_node[3])]  # Reload diff_13
-            })
-            # Wait, I corrupted v_node[0]... need to reload
-            # This approach is getting messy. Let me simplify.
+            # XOR with val
+            self.instrs.append({"valu": [("^", all_val[vi], all_val[vi], v_tmp1[2])]})
 
         # Hash all vectors
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
@@ -579,8 +568,9 @@ class KernelBuilder:
 
     def _emit_round_full_gather(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
                                  hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                                 n_vectors, tmp1):
-        """Full gather round with pipelining (from working baseline)."""
+                                 n_vectors, tmp1, skip_index=False):
+        """Full gather round with pipelining (from working baseline).
+        Note: skip_index not implemented for full gather due to complex interleaving."""
         n_groups = n_vectors // 4  # 8 groups
 
         for group_idx in range(n_groups):
