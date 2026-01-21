@@ -128,9 +128,11 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized vectorized kernel with UNROLL=4, handling slot limits properly.
+        Optimized vectorized kernel with heavy VLIW pipelining.
+        Key insight: Overlap operations across multiple vector groups.
         """
         UNROLL = 4  # Process 4 vectors per iteration (32 elements)
+        # With 256 elements / 8 VLEN / 4 UNROLL = 8 iterations per round
 
         # ============ ALLOCATION PHASE ============
         tmp1 = self.alloc_scratch("tmp1")
@@ -189,8 +191,11 @@ class KernelBuilder:
         self.add("load", ("const", loop_i, 0))
         batch_loop_start = len(self.instrs)
 
-        # Compute base addresses
+        # Compute base addresses and overlap with early loads
+        # Cycle 1: compute tmp1
         self.instrs.append({"alu": [("*", tmp1, loop_i, vlen_stride)]})
+
+        # Cycle 2: compute base[0]
         self.instrs.append({
             "alu": [
                 ("+", idx_base[0], self.scratch["inp_indices_p"], tmp1),
@@ -198,37 +203,71 @@ class KernelBuilder:
             ]
         })
 
-        # Compute other base addresses (can do up to 12 ALU ops)
+        # Cycle 3: compute base[1..3] + load vec 0
         alu_slots = []
         for u in range(1, UNROLL):
             alu_slots.append(("+", idx_base[u], idx_base[0], offsets[u]))
             alu_slots.append(("+", val_base[u], val_base[0], offsets[u]))
-        self.instrs.append({"alu": alu_slots})
+        self.instrs.append({
+            "alu": alu_slots,
+            "load": [
+                ("vload", v_idx[0], idx_base[0]),
+                ("vload", v_val[0], val_base[0]),
+            ]
+        })
 
-        # Load all indices and values (2 vloads per cycle)
-        for u in range(UNROLL):
-            self.instrs.append({
-                "load": [
-                    ("vload", v_idx[u], idx_base[u]),
-                    ("vload", v_val[u], val_base[u]),
-                ]
-            })
+        # Load remaining vecs while computing gather addresses for vec 0
+        # Cycle 4: load vec 1 + compute gather addrs for vec 0
+        self.instrs.append({
+            "load": [
+                ("vload", v_idx[1], idx_base[1]),
+                ("vload", v_val[1], val_base[1]),
+            ],
+            "alu": [
+                ("+", v_addrs[0] + vi, self.scratch["forest_values_p"], v_idx[0] + vi)
+                for vi in range(VLEN)
+            ]
+        })
 
-        # Compute gather addresses (8 ALU slots per vector, split across cycles)
-        for u in range(UNROLL):
-            self.instrs.append({
-                "alu": [
-                    ("+", v_addrs[u] + vi, self.scratch["forest_values_p"], v_idx[u] + vi)
-                    for vi in range(VLEN)
-                ]
-            })
+        # Cycle 5: load vec 2 + compute gather addrs for vec 1
+        self.instrs.append({
+            "load": [
+                ("vload", v_idx[2], idx_base[2]),
+                ("vload", v_val[2], val_base[2]),
+            ],
+            "alu": [
+                ("+", v_addrs[1] + vi, self.scratch["forest_values_p"], v_idx[1] + vi)
+                for vi in range(VLEN)
+            ]
+        })
+
+        # Cycle 6: load vec 3 + compute gather addrs for vec 2
+        self.instrs.append({
+            "load": [
+                ("vload", v_idx[3], idx_base[3]),
+                ("vload", v_val[3], val_base[3]),
+            ],
+            "alu": [
+                ("+", v_addrs[2] + vi, self.scratch["forest_values_p"], v_idx[2] + vi)
+                for vi in range(VLEN)
+            ]
+        })
 
         # ====== INTERLEAVED LOAD + COMPUTE SCHEDULE ======
-        # Group A = vectors 0,1; Group B = vectors 2,3
-        # Load Group A's node values first, then overlap Group B loads with Group A computation
+        # Cycle 7: compute gather addrs for vec 3 + start loading node_val for vec 0
+        self.instrs.append({
+            "alu": [
+                ("+", v_addrs[3] + vi, self.scratch["forest_values_p"], v_idx[3] + vi)
+                for vi in range(VLEN)
+            ],
+            "load": [
+                ("load", v_node_val[0] + 0, v_addrs[0] + 0),
+                ("load", v_node_val[0] + 1, v_addrs[0] + 1),
+            ]
+        })
 
-        # Load node values for Group A (vectors 0,1): 8 loads = 4 cycles
-        for vi in range(0, VLEN, 2):
+        # Continue loading Group A's node values (vectors 0,1)
+        for vi in range(2, VLEN, 2):
             self.instrs.append({
                 "load": [
                     ("load", v_node_val[0] + vi, v_addrs[0] + vi),
@@ -363,19 +402,38 @@ class KernelBuilder:
             valu_ops.append(("&", v_idx[u], v_idx[u], v_tmp1[u]))
         self.instrs.append({"valu": valu_ops})
 
-        # Store results (2 vstores per cycle)
-        for u in range(UNROLL):
-            self.instrs.append({
-                "store": [
-                    ("vstore", idx_base[u], v_idx[u]),
-                    ("vstore", val_base[u], v_val[u]),
-                ]
-            })
-
-        # Loop control
-        self.instrs.append({"flow": [("add_imm", loop_i, loop_i, 1)]})
-        self.instrs.append({"alu": [("<", tmp1, loop_i, n_iters_const)]})
-        self.instrs.append({"flow": [("cond_jump", tmp1, batch_loop_start)]})
+        # Store results + update loop counter (overlap store with ALU)
+        # First store
+        self.instrs.append({
+            "store": [
+                ("vstore", idx_base[0], v_idx[0]),
+                ("vstore", val_base[0], v_val[0]),
+            ],
+            "flow": [("add_imm", loop_i, loop_i, 1)]
+        })
+        # Second store + compare
+        self.instrs.append({
+            "store": [
+                ("vstore", idx_base[1], v_idx[1]),
+                ("vstore", val_base[1], v_val[1]),
+            ],
+            "alu": [("<", tmp1, loop_i, n_iters_const)]
+        })
+        # Third store
+        self.instrs.append({
+            "store": [
+                ("vstore", idx_base[2], v_idx[2]),
+                ("vstore", val_base[2], v_val[2]),
+            ]
+        })
+        # Fourth store + jump
+        self.instrs.append({
+            "store": [
+                ("vstore", idx_base[3], v_idx[3]),
+                ("vstore", val_base[3], v_val[3]),
+            ],
+            "flow": [("cond_jump", tmp1, batch_loop_start)]
+        })
 
         self.instrs.append({"flow": [("add_imm", round_ctr, round_ctr, 1)]})
         self.instrs.append({"alu": [("<", tmp1, round_ctr, rounds_const)]})
