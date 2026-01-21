@@ -180,7 +180,7 @@ class KernelBuilder:
                 )
             else:
                 # Full gather for all rounds with 4+ unique indices
-                # k=4 selection overhead exceeds load savings
+                # k=4 selection VALU overhead exceeds load savings
                 self._emit_round_full_gather(
                     all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
@@ -204,19 +204,12 @@ class KernelBuilder:
         self.add("load", ("load", tmp1, self.scratch["forest_values_p"]))
         self.add("valu", ("vbroadcast", v_node[0], tmp1))
 
-        # XOR all vectors with the single node value (3 at a time)
-        for vi in range(0, n_vectors, 3):
-            vecs = min(3, n_vectors - vi)
-            if vecs == 3:
-                self.instrs.append({
-                    "valu": [("^", all_val[vi], all_val[vi], v_node[0]),
-                             ("^", all_val[vi + 1], all_val[vi + 1], v_node[0]),
-                             ("^", all_val[vi + 2], all_val[vi + 2], v_node[0])]
-                })
-            else:
-                self.instrs.append({
-                    "valu": [("^", all_val[vi + j], all_val[vi + j], v_node[0]) for j in range(vecs)]
-                })
+        # XOR all vectors with the single node value (6 at a time for max VALU utilization)
+        for vi in range(0, n_vectors, 6):
+            vecs = min(6, n_vectors - vi)
+            self.instrs.append({
+                "valu": [("^", all_val[vi + j], all_val[vi + j], v_node[0]) for j in range(vecs)]
+            })
 
         # Hash all vectors
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
@@ -224,7 +217,7 @@ class KernelBuilder:
         # Index update all vectors (skip for last round)
         if not skip_index:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                                 skip_wrap_check=skip_wrap_check)
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
 
     def _emit_round_k2(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                        hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
@@ -298,7 +291,141 @@ class KernelBuilder:
         # Index update all vectors (skip for last round)
         if not skip_index:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                                 skip_wrap_check=skip_wrap_check)
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
+
+    def _emit_round_k4_efficient(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
+                                  hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                                  n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
+        """Efficient k=4 selection using 2-level binary tree.
+
+        For tree level 2, indices are in {idx_base, idx_base+1, idx_base+2, idx_base+3}.
+        Uses 2-level selection:
+          Level 1: Select between (n0,n1) and (n2,n3) based on bit 1 of offset
+          Level 2: Select between result pairs based on bit 0 of offset
+
+        Uses v_addrs for additional temp storage.
+        """
+        # Load 4 node values efficiently (parallel address compute, parallel loads)
+        # Compute addresses for all 4 nodes
+        node_addrs = [tmp1, tmp2, v_tmp1[0], v_tmp1[1]]
+        for i in range(4):
+            self.add("load", ("const", node_addrs[i], idx_base + i))
+        self.instrs.append({
+            "alu": [("+", node_addrs[0], self.scratch["forest_values_p"], node_addrs[0]),
+                    ("+", node_addrs[1], self.scratch["forest_values_p"], node_addrs[1])]
+        })
+        self.instrs.append({
+            "load": [("load", node_addrs[0], node_addrs[0]),
+                     ("load", node_addrs[1], node_addrs[1])]
+        })
+        self.instrs.append({
+            "alu": [("+", v_tmp1[0], self.scratch["forest_values_p"], v_tmp1[0]),
+                    ("+", v_tmp1[1], self.scratch["forest_values_p"], v_tmp1[1])]
+        })
+        self.instrs.append({
+            "load": [("load", v_tmp1[0], v_tmp1[0]),
+                     ("load", v_tmp1[1], v_tmp1[1])],
+            "valu": [("vbroadcast", v_node[0], node_addrs[0]),
+                     ("vbroadcast", v_node[1], node_addrs[1])]
+        })
+        self.instrs.append({
+            "valu": [("vbroadcast", v_node[2], v_tmp1[0]),
+                     ("vbroadcast", v_node[3], v_tmp1[1])]
+        })
+
+        # Create vector constants
+        idx_base_vec = self.scratch_const_vec(idx_base)
+
+        # Precompute diffs (reused for all vectors) - stored in v_tmp2[2:4]
+        diff02 = v_tmp2[2]
+        diff13 = v_tmp2[3]
+        self.instrs.append({
+            "valu": [("^", diff02, v_node[0], v_node[2]),
+                     ("^", diff13, v_node[1], v_node[3])]
+        })
+
+        # Process 2 vectors at a time with proper register management
+        # v_node[0:4] holds n0-n3 (must preserve)
+        # diff02, diff13 in v_tmp2[2:3] (must preserve)
+        # v_tmp1[0:4] and v_tmp2[0:2] available as temps for 2 vectors
+
+        for vi in range(0, n_vectors, 2):
+            # t0, t1 = offset for vec vi, vi+1
+            t = [v_tmp1[0], v_tmp1[1]]
+            self.instrs.append({
+                "valu": [("-", t[0], all_idx[vi], idx_base_vec),
+                         ("-", t[1], all_idx[vi+1], idx_base_vec)]
+            })
+
+            # mask1 = 0 - (offset >> 1)
+            self.instrs.append({
+                "valu": [(">>", v_tmp1[2], t[0], v_one),
+                         (">>", v_tmp1[3], t[1], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
+                         ("-", v_tmp1[3], v_zero, v_tmp1[3])]
+            })
+            # v_tmp1[2:4] = mask1 for vec vi, vi+1
+
+            # sel_low = n0 ^ (diff02 & mask1), sel_high = n1 ^ (diff13 & mask1)
+            # Use v_tmp2[0:2] for intermediate
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], diff02, v_tmp1[2]),  # diff02 & mask1 for vi
+                         ("&", v_tmp2[1], diff13, v_tmp1[2]),  # diff13 & mask1 for vi
+                         ("&", v_tmp1[2], diff02, v_tmp1[3]),  # diff02 & mask1 for vi+1
+                         ("&", v_tmp1[3], diff13, v_tmp1[3])]  # diff13 & mask1 for vi+1
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], v_node[0], v_tmp2[0]),  # sel_low for vi
+                         ("^", v_tmp2[1], v_node[1], v_tmp2[1]),  # sel_high for vi
+                         ("^", v_tmp1[2], v_node[0], v_tmp1[2]),  # sel_low for vi+1
+                         ("^", v_tmp1[3], v_node[1], v_tmp1[3])]  # sel_high for vi+1
+            })
+            # v_tmp2[0] = sel_low[vi], v_tmp2[1] = sel_high[vi]
+            # v_tmp1[2] = sel_low[vi+1], v_tmp1[3] = sel_high[vi+1]
+
+            # Level 2: mask0 = 0 - (offset & 1)
+            # First compute diff = sel_low ^ sel_high using v_addrs[0:2] as temps
+            self.instrs.append({
+                "valu": [("^", v_addrs[0], v_tmp2[0], v_tmp2[1]),   # diff for vi
+                         ("^", v_addrs[1], v_tmp1[2], v_tmp1[3])]   # diff for vi+1
+            })
+
+            # Now compute mask0 = 0 - (offset & 1)
+            self.instrs.append({
+                "valu": [("&", t[0], t[0], v_one),
+                         ("&", t[1], t[1], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", t[0], v_zero, t[0]),
+                         ("-", t[1], v_zero, t[1])]
+            })
+            # t[0], t[1] = mask0 for vec vi, vi+1
+
+            # final = sel_low ^ (diff & mask0)
+            self.instrs.append({
+                "valu": [("&", v_addrs[0], v_addrs[0], t[0]),   # diff & mask0 for vi
+                         ("&", v_addrs[1], v_addrs[1], t[1])]   # diff & mask0 for vi+1
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp1[0], v_tmp2[0], v_addrs[0]),   # final = sel_low ^ masked for vi
+                         ("^", v_tmp1[1], v_tmp1[2], v_addrs[1])]   # final for vi+1
+            })
+
+            # XOR with val
+            self.instrs.append({
+                "valu": [("^", all_val[vi], all_val[vi], v_tmp1[0]),
+                         ("^", all_val[vi+1], all_val[vi+1], v_tmp1[1])]
+            })
+
+        # Hash all vectors
+        self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
+
+        # Index update all vectors (skip for last round)
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
 
     def _emit_round_k4_optimized_v2(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                                      hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
@@ -1099,100 +1226,175 @@ class KernelBuilder:
                             })
 
     def _emit_index_all(self, all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                         skip_wrap_check=False):
-        """Index update all vectors, 3 at a time for better VALU utilization.
+                         skip_wrap_check=False, v_tmp2=None):
+        """Index update all vectors, 6 at a time for better VALU utilization.
 
         skip_wrap_check: If True, skip the comparison and masking (saves 3 instructions per group).
                         Use this for rounds where idx is guaranteed to stay < n_nodes.
         """
-        for vi in range(0, n_vectors, 3):
-            vecs = min(3, n_vectors - vi)
-            # new_idx = old_idx * 2 + (val & 1) + 1
-            # if new_idx >= n_nodes: new_idx = 0
-            if vecs == 3:
+        # Use v_tmp1[0:4] + v_tmp2[0:2] if available for 6-at-a-time processing
+        # new_idx = old_idx * 2 + (val & 1) + 1
+        # if new_idx >= n_nodes: new_idx = 0
+        for vi in range(0, n_vectors, 6):
+            vecs = min(6, n_vectors - vi)
+            if vecs == 6 and v_tmp2 is not None:
+                # Process 6 vectors using v_tmp1[0:4] + v_tmp2[0:2] as temps
+                temps = [v_tmp1[0], v_tmp1[1], v_tmp1[2], v_tmp1[3], v_tmp2[0], v_tmp2[1]]
+                # Step 1: & and * for vecs 0-2
                 self.instrs.append({
-                    "valu": [("&", v_tmp1[0], all_val[vi], v_one),
+                    "valu": [("&", temps[0], all_val[vi], v_one),
                              ("*", all_idx[vi], all_idx[vi], v_two),
-                             ("&", v_tmp1[1], all_val[vi+1], v_one),
+                             ("&", temps[1], all_val[vi+1], v_one),
                              ("*", all_idx[vi+1], all_idx[vi+1], v_two),
-                             ("&", v_tmp1[2], all_val[vi+2], v_one),
+                             ("&", temps[2], all_val[vi+2], v_one),
                              ("*", all_idx[vi+2], all_idx[vi+2], v_two)]
                 })
+                # Step 2: & and * for vecs 3-5
                 self.instrs.append({
-                    "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
-                             ("+", v_tmp1[1], v_tmp1[1], v_one),
-                             ("+", v_tmp1[2], v_tmp1[2], v_one)]
+                    "valu": [("&", temps[3], all_val[vi+3], v_one),
+                             ("*", all_idx[vi+3], all_idx[vi+3], v_two),
+                             ("&", temps[4], all_val[vi+4], v_one),
+                             ("*", all_idx[vi+4], all_idx[vi+4], v_two),
+                             ("&", temps[5], all_val[vi+5], v_one),
+                             ("*", all_idx[vi+5], all_idx[vi+5], v_two)]
                 })
+                # Step 3: + for all 6 temps
                 self.instrs.append({
-                    "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
-                             ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1]),
-                             ("+", all_idx[vi+2], all_idx[vi+2], v_tmp1[2])]
+                    "valu": [("+", temps[j], temps[j], v_one) for j in range(6)]
                 })
-                if not skip_wrap_check:
-                    self.instrs.append({
-                        "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes),
-                                 ("<", v_tmp1[1], all_idx[vi+1], v_n_nodes),
-                                 ("<", v_tmp1[2], all_idx[vi+2], v_n_nodes)]
-                    })
-                    self.instrs.append({
-                        "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
-                                 ("-", v_tmp1[1], v_zero, v_tmp1[1]),
-                                 ("-", v_tmp1[2], v_zero, v_tmp1[2])]
-                    })
-                    self.instrs.append({
-                        "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0]),
-                                 ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1]),
-                                 ("&", all_idx[vi+2], all_idx[vi+2], v_tmp1[2])]
-                    })
-            elif vecs == 2:
+                # Step 4: + for all 6 indices
                 self.instrs.append({
-                    "valu": [("&", v_tmp1[0], all_val[vi], v_one),
-                             ("*", all_idx[vi], all_idx[vi], v_two),
-                             ("&", v_tmp1[1], all_val[vi+1], v_one),
-                             ("*", all_idx[vi+1], all_idx[vi+1], v_two)]
-                })
-                self.instrs.append({
-                    "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
-                             ("+", v_tmp1[1], v_tmp1[1], v_one)]
-                })
-                self.instrs.append({
-                    "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
-                             ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
+                    "valu": [("+", all_idx[vi+j], all_idx[vi+j], temps[j]) for j in range(6)]
                 })
                 if not skip_wrap_check:
                     self.instrs.append({
-                        "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes),
-                                 ("<", v_tmp1[1], all_idx[vi+1], v_n_nodes)]
+                        "valu": [("<", temps[j], all_idx[vi+j], v_n_nodes) for j in range(6)]
                     })
                     self.instrs.append({
-                        "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
-                                 ("-", v_tmp1[1], v_zero, v_tmp1[1])]
+                        "valu": [("-", temps[j], v_zero, temps[j]) for j in range(6)]
                     })
                     self.instrs.append({
-                        "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0]),
-                                 ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
+                        "valu": [("&", all_idx[vi+j], all_idx[vi+j], temps[j]) for j in range(6)]
                     })
+            elif vecs >= 3:
+                # Fall back to 3 at a time
+                for v_off in range(0, vecs, 3):
+                    v_count = min(3, vecs - v_off)
+                    base = vi + v_off
+                    if v_count == 3:
+                        self.instrs.append({
+                            "valu": [("&", v_tmp1[0], all_val[base], v_one),
+                                     ("*", all_idx[base], all_idx[base], v_two),
+                                     ("&", v_tmp1[1], all_val[base+1], v_one),
+                                     ("*", all_idx[base+1], all_idx[base+1], v_two),
+                                     ("&", v_tmp1[2], all_val[base+2], v_one),
+                                     ("*", all_idx[base+2], all_idx[base+2], v_two)]
+                        })
+                        self.instrs.append({
+                            "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
+                                     ("+", v_tmp1[1], v_tmp1[1], v_one),
+                                     ("+", v_tmp1[2], v_tmp1[2], v_one)]
+                        })
+                        self.instrs.append({
+                            "valu": [("+", all_idx[base], all_idx[base], v_tmp1[0]),
+                                     ("+", all_idx[base+1], all_idx[base+1], v_tmp1[1]),
+                                     ("+", all_idx[base+2], all_idx[base+2], v_tmp1[2])]
+                        })
+                        if not skip_wrap_check:
+                            self.instrs.append({
+                                "valu": [("<", v_tmp1[0], all_idx[base], v_n_nodes),
+                                         ("<", v_tmp1[1], all_idx[base+1], v_n_nodes),
+                                         ("<", v_tmp1[2], all_idx[base+2], v_n_nodes)]
+                            })
+                            self.instrs.append({
+                                "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
+                                         ("-", v_tmp1[1], v_zero, v_tmp1[1]),
+                                         ("-", v_tmp1[2], v_zero, v_tmp1[2])]
+                            })
+                            self.instrs.append({
+                                "valu": [("&", all_idx[base], all_idx[base], v_tmp1[0]),
+                                         ("&", all_idx[base+1], all_idx[base+1], v_tmp1[1]),
+                                         ("&", all_idx[base+2], all_idx[base+2], v_tmp1[2])]
+                            })
+                    elif v_count == 2:
+                        self.instrs.append({
+                            "valu": [("&", v_tmp1[0], all_val[base], v_one),
+                                     ("*", all_idx[base], all_idx[base], v_two),
+                                     ("&", v_tmp1[1], all_val[base+1], v_one),
+                                     ("*", all_idx[base+1], all_idx[base+1], v_two)]
+                        })
+                        self.instrs.append({
+                            "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
+                                     ("+", v_tmp1[1], v_tmp1[1], v_one)]
+                        })
+                        self.instrs.append({
+                            "valu": [("+", all_idx[base], all_idx[base], v_tmp1[0]),
+                                     ("+", all_idx[base+1], all_idx[base+1], v_tmp1[1])]
+                        })
+                        if not skip_wrap_check:
+                            self.instrs.append({
+                                "valu": [("<", v_tmp1[0], all_idx[base], v_n_nodes),
+                                         ("<", v_tmp1[1], all_idx[base+1], v_n_nodes)]
+                            })
+                            self.instrs.append({
+                                "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
+                                         ("-", v_tmp1[1], v_zero, v_tmp1[1])]
+                            })
+                            self.instrs.append({
+                                "valu": [("&", all_idx[base], all_idx[base], v_tmp1[0]),
+                                         ("&", all_idx[base+1], all_idx[base+1], v_tmp1[1])]
+                            })
             else:
-                self.instrs.append({
-                    "valu": [("&", v_tmp1[0], all_val[vi], v_one),
-                             ("*", all_idx[vi], all_idx[vi], v_two)]
-                })
-                self.instrs.append({
-                    "valu": [("+", v_tmp1[0], v_tmp1[0], v_one)]
-                })
-                self.instrs.append({
-                    "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0])]
-                })
-                if not skip_wrap_check:
+                # 1-2 vectors
+                if vecs == 2:
                     self.instrs.append({
-                        "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes)]
+                        "valu": [("&", v_tmp1[0], all_val[vi], v_one),
+                                 ("*", all_idx[vi], all_idx[vi], v_two),
+                                 ("&", v_tmp1[1], all_val[vi+1], v_one),
+                                 ("*", all_idx[vi+1], all_idx[vi+1], v_two)]
                     })
                     self.instrs.append({
-                        "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0])]
+                        "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
+                                 ("+", v_tmp1[1], v_tmp1[1], v_one)]
                     })
                     self.instrs.append({
-                        "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0])]
+                        "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
+                                 ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
                     })
+                    if not skip_wrap_check:
+                        self.instrs.append({
+                            "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes),
+                                     ("<", v_tmp1[1], all_idx[vi+1], v_n_nodes)]
+                        })
+                        self.instrs.append({
+                            "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
+                                     ("-", v_tmp1[1], v_zero, v_tmp1[1])]
+                        })
+                        self.instrs.append({
+                            "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0]),
+                                     ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
+                        })
+                else:  # vecs == 1
+                    self.instrs.append({
+                        "valu": [("&", v_tmp1[0], all_val[vi], v_one),
+                                 ("*", all_idx[vi], all_idx[vi], v_two)]
+                    })
+                    self.instrs.append({
+                        "valu": [("+", v_tmp1[0], v_tmp1[0], v_one)]
+                    })
+                    self.instrs.append({
+                        "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0])]
+                    })
+                    if not skip_wrap_check:
+                        self.instrs.append({
+                            "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes)]
+                        })
+                        self.instrs.append({
+                            "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0])]
+                        })
+                        self.instrs.append({
+                            "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0])]
+                        })
 
     def _emit_round_full_gather(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                                  hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
