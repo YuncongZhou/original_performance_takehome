@@ -293,6 +293,219 @@ class KernelBuilder:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
                                  skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
 
+    def _emit_round_k4_fast(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
+                            hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                            n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
+        """Fast k=4 selection using 2-level binary tree, processing 2 vectors at a time.
+
+        Register allocation (MUST PRESERVE across loop iterations):
+        - v_node[0:4] holds n0-n3
+        - v_tmp2[2:4] holds diff02, diff13
+
+        Temps available per iteration:
+        - v_tmp1[0:4] - all available
+        - v_tmp2[0:2] - available
+        """
+        # Load 4 node values
+        self.add("load", ("const", tmp1, idx_base))
+        self.add("load", ("const", tmp2, idx_base + 1))
+        self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1),
+                                    ("+", tmp2, self.scratch["forest_values_p"], tmp2)]})
+        self.instrs.append({"load": [("load", tmp1, tmp1), ("load", tmp2, tmp2)]})
+        self.instrs.append({"valu": [("vbroadcast", v_node[0], tmp1),
+                                      ("vbroadcast", v_node[1], tmp2)]})
+
+        self.add("load", ("const", tmp1, idx_base + 2))
+        self.add("load", ("const", tmp2, idx_base + 3))
+        self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1),
+                                    ("+", tmp2, self.scratch["forest_values_p"], tmp2)]})
+        self.instrs.append({"load": [("load", tmp1, tmp1), ("load", tmp2, tmp2)]})
+        self.instrs.append({"valu": [("vbroadcast", v_node[2], tmp1),
+                                      ("vbroadcast", v_node[3], tmp2)]})
+
+        idx_base_vec = self.scratch_const_vec(idx_base)
+
+        # Precompute diffs (reused for all vectors) - stored in v_tmp2[2:4]
+        diff02 = v_tmp2[2]
+        diff13 = v_tmp2[3]
+        self.instrs.append({
+            "valu": [("^", diff02, v_node[0], v_node[2]),
+                     ("^", diff13, v_node[1], v_node[3])]
+        })
+
+        # Process 2 vectors at a time - safe register usage
+        for vi in range(0, n_vectors, 2):
+            vecs = min(2, n_vectors - vi)
+
+            # offset = idx - idx_base (0-3), store in v_tmp1[0:vecs]
+            self.instrs.append({
+                "valu": [("-", v_tmp1[j], all_idx[vi+j], idx_base_vec) for j in range(vecs)]
+            })
+
+            # Save offset copy in v_tmp1[2:4] for level 2
+            self.instrs.append({
+                "valu": [("+", v_tmp1[2+j], v_tmp1[j], v_zero) for j in range(vecs)]
+            })
+
+            # Level 1: bit1 = offset >> 1, mask1 = 0 - bit1
+            self.instrs.append({
+                "valu": [(">>", v_tmp1[j], v_tmp1[j], v_one) for j in range(vecs)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[j], v_zero, v_tmp1[j]) for j in range(vecs)]
+            })
+            # v_tmp1[0:vecs] now has mask1
+
+            # sel_low = n0 ^ (diff02 & mask1), store in v_tmp2[0:vecs]
+            self.instrs.append({
+                "valu": [("&", v_tmp2[j], diff02, v_tmp1[j]) for j in range(vecs)]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[j], v_node[0], v_tmp2[j]) for j in range(vecs)]
+            })
+            # v_tmp2[0:vecs] now has sel_low
+
+            # sel_high = n1 ^ (diff13 & mask1), store in v_tmp1[0:vecs]
+            self.instrs.append({
+                "valu": [("&", v_tmp1[j], diff13, v_tmp1[j]) for j in range(vecs)]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp1[j], v_node[1], v_tmp1[j]) for j in range(vecs)]
+            })
+            # v_tmp1[0:vecs] now has sel_high
+
+            # Level 2: bit0 = offset & 1, mask0 = 0 - bit0
+            # offset was saved in v_tmp1[2:4]
+            self.instrs.append({
+                "valu": [("&", v_tmp1[2+j], v_tmp1[2+j], v_one) for j in range(vecs)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[2+j], v_zero, v_tmp1[2+j]) for j in range(vecs)]
+            })
+            # v_tmp1[2:2+vecs] now has mask0
+
+            # diff_lowhigh = sel_low ^ sel_high, store in v_tmp1[0:vecs]
+            self.instrs.append({
+                "valu": [("^", v_tmp1[j], v_tmp2[j], v_tmp1[j]) for j in range(vecs)]
+            })
+
+            # result = sel_low ^ (diff_lowhigh & mask0)
+            self.instrs.append({
+                "valu": [("&", v_tmp1[j], v_tmp1[j], v_tmp1[2+j]) for j in range(vecs)]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp1[j], v_tmp2[j], v_tmp1[j]) for j in range(vecs)]
+            })
+            # v_tmp1[0:vecs] now has final selected node value
+
+            # XOR with val
+            self.instrs.append({
+                "valu": [("^", all_val[vi+j], all_val[vi+j], v_tmp1[j]) for j in range(vecs)]
+            })
+
+        # Hash all vectors
+        self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
+
+        # Index update
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
+
+    def _emit_round_k8_fast(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
+                            hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                            n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
+        """Fast k=8 selection using 3-level binary tree."""
+        # Load 8 node values - use v_addrs[0:4] for extra storage
+        # Load first 4
+        for i in range(4):
+            self.add("load", ("const", tmp1, idx_base + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", v_node[i], tmp1))
+
+        # Load next 4 into v_addrs (repurposed as node storage)
+        for i in range(4):
+            self.add("load", ("const", tmp1, idx_base + 4 + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", v_addrs[i], tmp1))
+
+        idx_base_vec = self.scratch_const_vec(idx_base)
+        v_four = self.scratch_const_vec(4)
+
+        # For k=8, we do 3-level selection
+        # Level 1: select between (n0-n3) and (n4-n7) based on bit 2
+        # Level 2: select within the 4-set based on bit 1
+        # Level 3: select between pair based on bit 0
+
+        for vi in range(0, n_vectors, 2):
+            vecs = min(2, n_vectors - vi)
+
+            # offset = idx - idx_base (0-7)
+            self.instrs.append({
+                "valu": [("-", v_tmp1[j], all_idx[vi+j], idx_base_vec) for j in range(vecs)]
+            })
+
+            # Level 1: bit2 = offset >= 4 ? 1 : 0, mask2 = 0 - bit2
+            # bit2 = offset >> 2
+            self.instrs.append({
+                "valu": [(">>", v_tmp1[j], v_tmp1[j], v_two) for j in range(vecs)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[j], v_zero, v_tmp1[j]) for j in range(vecs)]
+            })
+            # v_tmp1[0:vecs] has mask2
+
+            # Select between (n0,n1,n2,n3) and (n4,n5,n6,n7) based on mask2
+            # sel_0 = n0 ^ ((n0^n4) & mask2), etc.
+            for k in range(4):
+                self.instrs.append({
+                    "valu": [("^", v_tmp2[j], v_node[k], v_addrs[k]) for j in range(vecs)]
+                })
+                self.instrs.append({
+                    "valu": [("&", v_tmp2[j], v_tmp2[j], v_tmp1[j]) for j in range(vecs)]
+                })
+                self.instrs.append({
+                    "valu": [("^", v_tmp2[j], v_node[k], v_tmp2[j]) for j in range(vecs)]
+                })
+                # Store selected value (use different location based on k)
+                if k == 0:
+                    for j in range(vecs):
+                        self.instrs.append({"valu": [("^", v_tmp1[2+j], v_tmp2[j], v_zero)]})  # Copy
+                elif k == 1:
+                    for j in range(vecs):
+                        self.instrs.append({"valu": [("^", v_tmp1[3] if j == 0 else v_addrs[0], v_tmp2[j], v_zero)]})
+                # For k=2,3 we'll compute inline in level 2
+
+            # This approach is getting complex. Let me use a simpler per-vector approach
+            # that's still efficient
+
+        # Actually, let's just use full gather for k=8 for now - the overhead of
+        # 3-level selection is significant
+        # Fall back to full gather
+        pass
+
+        # For now, use full gather for k=8 (simpler, still correct)
+        # We can optimize this later
+        self._emit_round_full_gather(
+            all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs,  # Note: v_addrs2 not passed
+            hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+            n_vectors, tmp1, skip_index=skip_index,
+            skip_wrap_check=skip_wrap_check
+        )
+
+    def _emit_round_k16_fast(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
+                             hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                             n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
+        """Fast k=16 selection - for now fall back to full gather."""
+        # k=16 selection has significant overhead, use full gather
+        self._emit_round_full_gather(
+            all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
+            hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+            n_vectors, tmp1, skip_index=skip_index,
+            skip_wrap_check=skip_wrap_check
+        )
+
     def _emit_round_k4_efficient(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
                                   hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                                   n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
@@ -1785,6 +1998,111 @@ class KernelBuilder:
                     })
 
 
+def optimize_instructions(instrs):
+    """Post-process instruction list to merge instructions where possible."""
+
+    def get_valu_written_addrs(instr):
+        '''Get addresses written by VALU ops (destination is element 1)'''
+        written = set()
+        for op in instr.get('valu', []):
+            if len(op) >= 2:
+                dest = op[1]
+                for offset in range(8):  # VLEN = 8
+                    written.add(dest + offset)
+        return written
+
+    def get_valu_read_addrs(instr):
+        '''Get addresses read by VALU ops'''
+        read = set()
+        for op in instr.get('valu', []):
+            for src_idx in range(2, len(op)):
+                src = op[src_idx]
+                if isinstance(src, int):
+                    for offset in range(8):
+                        read.add(src + offset)
+        return read
+
+    def get_load_written_addrs(instr):
+        '''Get addresses written by load ops'''
+        written = set()
+        for op in instr.get('load', []):
+            if op[0] in ('load', 'const'):
+                written.add(op[1])
+            elif op[0] == 'vload':
+                for offset in range(8):
+                    written.add(op[1] + offset)
+        return written
+
+    def can_merge_valu(instr1, instr2):
+        '''Check if two VALU-only instructions can be merged'''
+        if set(instr1.keys()) != {'valu'} or set(instr2.keys()) != {'valu'}:
+            return False
+        if len(instr1['valu']) + len(instr2['valu']) > 6:
+            return False
+        written1 = get_valu_written_addrs(instr1)
+        read2 = get_valu_read_addrs(instr2)
+        if written1 & read2:
+            return False
+        return True
+
+    def can_add_valu_to_load(load_instr, valu_instr):
+        '''Check if VALU ops can be added to a load instruction'''
+        if 'valu' in load_instr:
+            return False
+        if 'load' not in load_instr:
+            return False
+        if set(valu_instr.keys()) != {'valu'}:
+            return False
+        if len(valu_instr['valu']) > 6:
+            return False
+        # Check that VALU doesn't read what load writes
+        load_writes = get_load_written_addrs(load_instr)
+        valu_reads = get_valu_read_addrs(valu_instr)
+        if load_writes & valu_reads:
+            return False
+        return True
+
+    # Iteratively merge until no more merges possible
+    total_merged = 0
+    current = list(instrs)
+    iteration = 0
+    while iteration < 10:  # Limit iterations
+        optimized = []
+        i = 0
+        merged_this_pass = 0
+        while i < len(current):
+            instr = current[i]
+            merged = False
+
+            # Try to merge consecutive VALU instructions
+            if i + 1 < len(current) and can_merge_valu(instr, current[i + 1]):
+                new_instr = {'valu': instr['valu'] + current[i + 1]['valu']}
+                optimized.append(new_instr)
+                merged_this_pass += 1
+                i += 2
+                merged = True
+            # Try to add VALU to load instruction
+            elif i + 1 < len(current) and can_add_valu_to_load(instr, current[i + 1]):
+                new_instr = dict(instr)
+                new_instr['valu'] = list(current[i + 1]['valu'])
+                optimized.append(new_instr)
+                merged_this_pass += 1
+                i += 2
+                merged = True
+
+            if not merged:
+                optimized.append(instr)
+                i += 1
+
+        total_merged += merged_this_pass
+        current = optimized
+        iteration += 1
+        if merged_this_pass == 0:
+            break
+
+    return current, total_merged
+
+
 BASELINE = 147734
 
 def do_kernel_test(
@@ -1800,7 +2118,12 @@ def do_kernel_test(
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
 
-    machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES, trace=trace)
+    # Apply optimization pass
+    optimized_instrs, merged_count = optimize_instructions(kb.instrs)
+    if prints:
+        print(f"Merged {merged_count} instruction pairs")
+
+    machine = Machine(mem, optimized_instrs, kb.debug_info(), n_cores=N_CORES, trace=trace)
     machine.enable_pause = False
     machine.enable_debug = False
     machine.run()
