@@ -111,9 +111,21 @@ class KernelBuilder:
         v_two = self.scratch_const_vec(2)
         v_n_nodes = self.scratch_const_vec(n_nodes)
 
+        # Hash constants - some stages can use multiply_add for optimization
+        # Stage 0: (a + c) + (a << 12) = a * 4097 + c → multiply_add(a, 4097, c)
+        # Stage 2: (a + c) + (a << 5) = a * 33 + c → multiply_add(a, 33, c)
+        # Stage 4: (a + c) + (a << 3) = a * 9 + c → multiply_add(a, 9, c)
         hash_const_vecs = []
+        hash_multipliers = {0: 4097, 2: 33, 4: 9}  # Stages that can use multiply_add
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            hash_const_vecs.append((self.scratch_const_vec(val1), self.scratch_const_vec(val3)))
+            if hi in hash_multipliers:
+                # For multiply_add stages: store (multiplier_vec, additive_const_vec)
+                mult_vec = self.scratch_const_vec(hash_multipliers[hi])
+                const_vec = self.scratch_const_vec(val1)
+                hash_const_vecs.append(('multiply_add', mult_vec, const_vec))
+            else:
+                # For regular stages: store (const1_vec, const3_vec)
+                hash_const_vecs.append(('regular', self.scratch_const_vec(val1), self.scratch_const_vec(val3)))
 
         self.add("flow", ("pause",))
 
@@ -780,217 +792,133 @@ class KernelBuilder:
 
     def _emit_hash_all(self, all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors,
                         extra_alu_ops=None, extra_load_ops=None):
-        """Hash all vectors with pipelined VALU utilization.
+        """Hash all vectors using multiply_add optimization for stages 0, 2, 4.
 
-        Uses software pipelining to overlap op2 (combine) of one group with
-        op1/op3 (compute) of the next group, maximizing VALU slot utilization.
+        Stages 0, 2, 4 use multiply_add: dest = a * mult + const (1 VALU op)
+        Stages 1, 3, 5 use regular: op1, op3, then op2 (3 VALU ops, can pipeline)
 
-        Also allows overlapping ALU/Load operations during hash computation.
-        extra_alu_ops: list of (op, dst, src1, src2) tuples to interleave
-        extra_load_ops: list of (type, dst, src) tuples to interleave
+        This reduces hash from 18 ops to 12 ops per vector (33% reduction).
         """
-        alu_idx = 0
-        load_idx = 0
-        extra_alu = extra_alu_ops or []
-        extra_load = extra_load_ops or []
-
-        def get_alu_batch(n):
-            nonlocal alu_idx
-            batch = extra_alu[alu_idx:alu_idx + n]
-            alu_idx += len(batch)
-            return batch
-
-        def get_load_batch(n):
-            nonlocal load_idx
-            batch = extra_load[load_idx:load_idx + n]
-            load_idx += len(batch)
-            return batch
-
-        # Process 6 vectors at a time with pipelining for better slot utilization
-        # Pattern: compute(v0-2), combine(v0-2)+compute(v3-5), combine(v3-5)
+        # Process 6 vectors at a time for maximum VALU slot utilization
         for vi in range(0, n_vectors, 6):
             vecs = min(6, n_vectors - vi)
 
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                const1, const3 = hash_const_vecs[hi]
+            for hi, stage_info in enumerate(hash_const_vecs):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
 
-                if vecs >= 6:
-                    # Full 6-vector batch with pipelining
-                    # Instr 1: compute for v0-2 (6 slots)
-                    instr1 = {
-                        "valu": [(op1, v_tmp1[0], all_val[vi], const1),
-                                 (op3, v_tmp2[0], all_val[vi], const3),
-                                 (op1, v_tmp1[1], all_val[vi+1], const1),
-                                 (op3, v_tmp2[1], all_val[vi+1], const3),
-                                 (op1, v_tmp1[2], all_val[vi+2], const1),
-                                 (op3, v_tmp2[2], all_val[vi+2], const3)]
-                    }
-                    alu_batch = get_alu_batch(12)
-                    if alu_batch:
-                        instr1["alu"] = alu_batch
-                    load_batch = get_load_batch(2)
-                    if load_batch:
-                        instr1["load"] = load_batch
-                    self.instrs.append(instr1)
-
-                    # Instr 2: combine v0-2 + compute v3-5 (3 + 6 = 9, but only 6 slots)
-                    # Split: combine v0-2 (3) + compute v3 (2) + op1 for v4 (1) = 6
-                    instr2 = {
-                        "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0]),
-                                 (op2, all_val[vi+1], v_tmp1[1], v_tmp2[1]),
-                                 (op2, all_val[vi+2], v_tmp1[2], v_tmp2[2]),
-                                 (op1, v_tmp1[0], all_val[vi+3], const1),
-                                 (op3, v_tmp2[0], all_val[vi+3], const3),
-                                 (op1, v_tmp1[1], all_val[vi+4], const1)]
-                    }
-                    alu_batch = get_alu_batch(12)
-                    if alu_batch:
-                        instr2["alu"] = alu_batch
-                    load_batch = get_load_batch(2)
-                    if load_batch:
-                        instr2["load"] = load_batch
-                    self.instrs.append(instr2)
-
-                    # Instr 3: finish compute v4-5 + combine v3 (3 + 1 + 2 = 6)
-                    instr3 = {
-                        "valu": [(op3, v_tmp2[1], all_val[vi+4], const3),
-                                 (op1, v_tmp1[2], all_val[vi+5], const1),
-                                 (op3, v_tmp2[2], all_val[vi+5], const3),
-                                 (op2, all_val[vi+3], v_tmp1[0], v_tmp2[0])]
-                    }
-                    alu_batch = get_alu_batch(12)
-                    if alu_batch:
-                        instr3["alu"] = alu_batch
-                    load_batch = get_load_batch(2)
-                    if load_batch:
-                        instr3["load"] = load_batch
-                    self.instrs.append(instr3)
-
-                    # Instr 4: combine v4-5 (2 slots)
-                    instr4 = {
-                        "valu": [(op2, all_val[vi+4], v_tmp1[1], v_tmp2[1]),
-                                 (op2, all_val[vi+5], v_tmp1[2], v_tmp2[2])]
-                    }
-                    alu_batch = get_alu_batch(12)
-                    if alu_batch:
-                        instr4["alu"] = alu_batch
-                    load_batch = get_load_batch(2)
-                    if load_batch:
-                        instr4["load"] = load_batch
-                    self.instrs.append(instr4)
-
-                elif vecs >= 3:
-                    # 3-5 vectors - use original approach but with extra ops
-                    for v_off in range(0, vecs, 3):
-                        v_count = min(3, vecs - v_off)
-                        base = vi + v_off
-
-                        if v_count == 3:
-                            instr1 = {
-                                "valu": [(op1, v_tmp1[0], all_val[base], const1),
-                                         (op3, v_tmp2[0], all_val[base], const3),
-                                         (op1, v_tmp1[1], all_val[base+1], const1),
-                                         (op3, v_tmp2[1], all_val[base+1], const3),
-                                         (op1, v_tmp1[2], all_val[base+2], const1),
-                                         (op3, v_tmp2[2], all_val[base+2], const3)]
-                            }
-                            alu_batch = get_alu_batch(12)
-                            if alu_batch:
-                                instr1["alu"] = alu_batch
-                            load_batch = get_load_batch(2)
-                            if load_batch:
-                                instr1["load"] = load_batch
-                            self.instrs.append(instr1)
-
-                            instr2 = {
-                                "valu": [(op2, all_val[base], v_tmp1[0], v_tmp2[0]),
-                                         (op2, all_val[base+1], v_tmp1[1], v_tmp2[1]),
-                                         (op2, all_val[base+2], v_tmp1[2], v_tmp2[2])]
-                            }
-                            alu_batch = get_alu_batch(12)
-                            if alu_batch:
-                                instr2["alu"] = alu_batch
-                            load_batch = get_load_batch(2)
-                            if load_batch:
-                                instr2["load"] = load_batch
-                            self.instrs.append(instr2)
-                        elif v_count == 2:
-                            instr1 = {
-                                "valu": [(op1, v_tmp1[0], all_val[base], const1),
-                                         (op3, v_tmp2[0], all_val[base], const3),
-                                         (op1, v_tmp1[1], all_val[base+1], const1),
-                                         (op3, v_tmp2[1], all_val[base+1], const3)]
-                            }
-                            alu_batch = get_alu_batch(12)
-                            if alu_batch:
-                                instr1["alu"] = alu_batch
-                            load_batch = get_load_batch(2)
-                            if load_batch:
-                                instr1["load"] = load_batch
-                            self.instrs.append(instr1)
-
-                            instr2 = {
-                                "valu": [(op2, all_val[base], v_tmp1[0], v_tmp2[0]),
-                                         (op2, all_val[base+1], v_tmp1[1], v_tmp2[1])]
-                            }
-                            alu_batch = get_alu_batch(12)
-                            if alu_batch:
-                                instr2["alu"] = alu_batch
-                            load_batch = get_load_batch(2)
-                            if load_batch:
-                                instr2["load"] = load_batch
-                            self.instrs.append(instr2)
+                if stage_info[0] == 'multiply_add':
+                    # Stages 0, 2, 4: use multiply_add (1 op per vector)
+                    _, mult_vec, const_vec = stage_info
+                    if vecs >= 6:
+                        # Process all 6 vectors in one instruction
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[vi+j], all_val[vi+j], mult_vec, const_vec)
+                                     for j in range(6)]
+                        })
+                    elif vecs >= 3:
+                        # Process 3 vectors
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[vi+j], all_val[vi+j], mult_vec, const_vec)
+                                     for j in range(vecs)]
+                        })
+                    else:
+                        # Process 1-2 vectors
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[vi+j], all_val[vi+j], mult_vec, const_vec)
+                                     for j in range(vecs)]
+                        })
                 else:
-                    # 1-2 vectors
-                    if vecs == 2:
-                        instr1 = {
+                    # Stages 1, 3, 5: regular 3-op pattern with pipelining
+                    _, const1, const3 = stage_info
+
+                    if vecs >= 6:
+                        # Full 6-vector batch with pipelining
+                        # Instr 1: compute op1+op3 for v0-2 (6 slots)
+                        self.instrs.append({
                             "valu": [(op1, v_tmp1[0], all_val[vi], const1),
                                      (op3, v_tmp2[0], all_val[vi], const3),
                                      (op1, v_tmp1[1], all_val[vi+1], const1),
-                                     (op3, v_tmp2[1], all_val[vi+1], const3)]
-                        }
-                        alu_batch = get_alu_batch(12)
-                        if alu_batch:
-                            instr1["alu"] = alu_batch
-                        load_batch = get_load_batch(2)
-                        if load_batch:
-                            instr1["load"] = load_batch
-                        self.instrs.append(instr1)
+                                     (op3, v_tmp2[1], all_val[vi+1], const3),
+                                     (op1, v_tmp1[2], all_val[vi+2], const1),
+                                     (op3, v_tmp2[2], all_val[vi+2], const3)]
+                        })
 
-                        instr2 = {
+                        # Instr 2: combine v0-2 + start compute v3-5
+                        self.instrs.append({
                             "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0]),
-                                     (op2, all_val[vi+1], v_tmp1[1], v_tmp2[1])]
-                        }
-                        alu_batch = get_alu_batch(12)
-                        if alu_batch:
-                            instr2["alu"] = alu_batch
-                        load_batch = get_load_batch(2)
-                        if load_batch:
-                            instr2["load"] = load_batch
-                        self.instrs.append(instr2)
-                    else:
-                        instr1 = {
-                            "valu": [(op1, v_tmp1[0], all_val[vi], const1),
-                                     (op3, v_tmp2[0], all_val[vi], const3)]
-                        }
-                        alu_batch = get_alu_batch(12)
-                        if alu_batch:
-                            instr1["alu"] = alu_batch
-                        load_batch = get_load_batch(2)
-                        if load_batch:
-                            instr1["load"] = load_batch
-                        self.instrs.append(instr1)
+                                     (op2, all_val[vi+1], v_tmp1[1], v_tmp2[1]),
+                                     (op2, all_val[vi+2], v_tmp1[2], v_tmp2[2]),
+                                     (op1, v_tmp1[0], all_val[vi+3], const1),
+                                     (op3, v_tmp2[0], all_val[vi+3], const3),
+                                     (op1, v_tmp1[1], all_val[vi+4], const1)]
+                        })
 
-                        instr2 = {
-                            "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0])]
-                        }
-                        alu_batch = get_alu_batch(12)
-                        if alu_batch:
-                            instr2["alu"] = alu_batch
-                        load_batch = get_load_batch(2)
-                        if load_batch:
-                            instr2["load"] = load_batch
-                        self.instrs.append(instr2)
+                        # Instr 3: finish compute v4-5 + combine v3
+                        self.instrs.append({
+                            "valu": [(op3, v_tmp2[1], all_val[vi+4], const3),
+                                     (op1, v_tmp1[2], all_val[vi+5], const1),
+                                     (op3, v_tmp2[2], all_val[vi+5], const3),
+                                     (op2, all_val[vi+3], v_tmp1[0], v_tmp2[0])]
+                        })
+
+                        # Instr 4: combine v4-5
+                        self.instrs.append({
+                            "valu": [(op2, all_val[vi+4], v_tmp1[1], v_tmp2[1]),
+                                     (op2, all_val[vi+5], v_tmp1[2], v_tmp2[2])]
+                        })
+
+                    elif vecs >= 3:
+                        # 3-5 vectors
+                        for v_off in range(0, vecs, 3):
+                            v_count = min(3, vecs - v_off)
+                            base = vi + v_off
+
+                            if v_count == 3:
+                                self.instrs.append({
+                                    "valu": [(op1, v_tmp1[0], all_val[base], const1),
+                                             (op3, v_tmp2[0], all_val[base], const3),
+                                             (op1, v_tmp1[1], all_val[base+1], const1),
+                                             (op3, v_tmp2[1], all_val[base+1], const3),
+                                             (op1, v_tmp1[2], all_val[base+2], const1),
+                                             (op3, v_tmp2[2], all_val[base+2], const3)]
+                                })
+                                self.instrs.append({
+                                    "valu": [(op2, all_val[base], v_tmp1[0], v_tmp2[0]),
+                                             (op2, all_val[base+1], v_tmp1[1], v_tmp2[1]),
+                                             (op2, all_val[base+2], v_tmp1[2], v_tmp2[2])]
+                                })
+                            else:  # v_count == 2
+                                self.instrs.append({
+                                    "valu": [(op1, v_tmp1[0], all_val[base], const1),
+                                             (op3, v_tmp2[0], all_val[base], const3),
+                                             (op1, v_tmp1[1], all_val[base+1], const1),
+                                             (op3, v_tmp2[1], all_val[base+1], const3)]
+                                })
+                                self.instrs.append({
+                                    "valu": [(op2, all_val[base], v_tmp1[0], v_tmp2[0]),
+                                             (op2, all_val[base+1], v_tmp1[1], v_tmp2[1])]
+                                })
+                    else:
+                        # 1-2 vectors
+                        if vecs == 2:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[0], all_val[vi], const1),
+                                         (op3, v_tmp2[0], all_val[vi], const3),
+                                         (op1, v_tmp1[1], all_val[vi+1], const1),
+                                         (op3, v_tmp2[1], all_val[vi+1], const3)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0]),
+                                         (op2, all_val[vi+1], v_tmp1[1], v_tmp2[1])]
+                            })
+                        else:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[0], all_val[vi], const1),
+                                         (op3, v_tmp2[0], all_val[vi], const3)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0])]
+                            })
 
     def _emit_index_all(self, all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
                          skip_wrap_check=False):
@@ -1204,42 +1132,63 @@ class KernelBuilder:
 
             # Hash A + Gather B overlapped (start from load_idx=1)
             load_idx = 1
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                const1_vec, const3_vec = hash_const_vecs[hi]
+            for hi, stage_info in enumerate(hash_const_vecs):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
 
-                vi = load_idx
-                if vi < VLEN:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[0], all_val[g], const1_vec),
-                                 (op3, v_tmp2[0], all_val[g], const3_vec),
-                                 (op1, v_tmp1[1], all_val[g + 1], const1_vec),
-                                 (op3, v_tmp2[1], all_val[g + 1], const3_vec)],
-                        "load": [("load", v_node[2] + vi, cur_addrs[2] + vi),
-                                 ("load", v_node[3] + vi, cur_addrs[3] + vi)]
-                    })
-                    load_idx += 1
+                if stage_info[0] == 'multiply_add':
+                    # multiply_add stage: 1 instruction with 2 multiply_add ops
+                    _, mult_vec, const_vec = stage_info
+                    vi = load_idx
+                    if vi < VLEN:
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[g], all_val[g], mult_vec, const_vec),
+                                     ("multiply_add", all_val[g + 1], all_val[g + 1], mult_vec, const_vec)],
+                            "load": [("load", v_node[2] + vi, cur_addrs[2] + vi),
+                                     ("load", v_node[3] + vi, cur_addrs[3] + vi)]
+                        })
+                        load_idx += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[g], all_val[g], mult_vec, const_vec),
+                                     ("multiply_add", all_val[g + 1], all_val[g + 1], mult_vec, const_vec)]
+                        })
                 else:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[0], all_val[g], const1_vec),
-                                 (op3, v_tmp2[0], all_val[g], const3_vec),
-                                 (op1, v_tmp1[1], all_val[g + 1], const1_vec),
-                                 (op3, v_tmp2[1], all_val[g + 1], const3_vec)]
-                    })
+                    # Regular stage: 2 instructions (compute, then combine)
+                    _, const1_vec, const3_vec = stage_info
 
-                vi = load_idx
-                if vi < VLEN:
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
-                                 (op2, all_val[g + 1], v_tmp1[1], v_tmp2[1])],
-                        "load": [("load", v_node[2] + vi, cur_addrs[2] + vi),
-                                 ("load", v_node[3] + vi, cur_addrs[3] + vi)]
-                    })
-                    load_idx += 1
-                else:
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
-                                 (op2, all_val[g + 1], v_tmp1[1], v_tmp2[1])]
-                    })
+                    vi = load_idx
+                    if vi < VLEN:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[0], all_val[g], const1_vec),
+                                     (op3, v_tmp2[0], all_val[g], const3_vec),
+                                     (op1, v_tmp1[1], all_val[g + 1], const1_vec),
+                                     (op3, v_tmp2[1], all_val[g + 1], const3_vec)],
+                            "load": [("load", v_node[2] + vi, cur_addrs[2] + vi),
+                                     ("load", v_node[3] + vi, cur_addrs[3] + vi)]
+                        })
+                        load_idx += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[0], all_val[g], const1_vec),
+                                     (op3, v_tmp2[0], all_val[g], const3_vec),
+                                     (op1, v_tmp1[1], all_val[g + 1], const1_vec),
+                                     (op3, v_tmp2[1], all_val[g + 1], const3_vec)]
+                        })
+
+                    vi = load_idx
+                    if vi < VLEN:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
+                                     (op2, all_val[g + 1], v_tmp1[1], v_tmp2[1])],
+                            "load": [("load", v_node[2] + vi, cur_addrs[2] + vi),
+                                     ("load", v_node[3] + vi, cur_addrs[3] + vi)]
+                        })
+                        load_idx += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
+                                     (op2, all_val[g + 1], v_tmp1[1], v_tmp2[1])]
+                        })
 
             while load_idx < VLEN:
                 self.instrs.append({
@@ -1255,31 +1204,150 @@ class KernelBuilder:
             })
 
             # Hash B + Index A (skip Index A when skip_index is True)
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                const1_vec, const3_vec = hash_const_vecs[hi]
+            # Note: stages 0, 2, 4 are multiply_add (1 instr), stages 1, 3, 5 are regular (2 instr)
+            # Index A needs to be interleaved across all stages
+            for hi, stage_info in enumerate(hash_const_vecs):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                is_multiply_add = (stage_info[0] == 'multiply_add')
+
+                if is_multiply_add:
+                    _, mult_vec, const_vec = stage_info
+                else:
+                    _, const1_vec, const3_vec = stage_info
 
                 if skip_index:
                     # Skip index operations on last round, but still compute addresses for next group
-                    if hi == 4 and has_next_group:
+                    if is_multiply_add:
+                        if hi == 4 and has_next_group:
+                            self.instrs.append({
+                                "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                         ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec)],
+                                "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)] +
+                                       [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(4)]
+                            })
+                        else:
+                            self.instrs.append({
+                                "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                         ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec)]
+                            })
+                    else:
+                        if hi == 5 and has_next_group:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                         (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                         (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                         (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
+                                "alu": [("+", next_addrs[1] + 4 + vi, fp, all_idx[ng + 1] + 4 + vi) for vi in range(4)] +
+                                       [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                         (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
+                                "alu": [("+", next_addrs[3] + vi, fp, all_idx[ng + 3] + vi) for vi in range(8)]
+                            })
+                        else:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                         (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                         (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                         (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                         (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
+                            })
+                elif hi == 0:
+                    # Stage 0 is multiply_add - interleave with Index A start
+                    self.instrs.append({
+                        "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                 ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec),
+                                 ("&", v_node[0], all_val[g], v_one),
+                                 ("*", all_idx[g], all_idx[g], v_two),
+                                 ("&", v_node[1], all_val[g + 1], v_one),
+                                 ("*", all_idx[g + 1], all_idx[g + 1], v_two)]
+                    })
+                elif hi == 1:
+                    # Stage 1 is regular - interleave with Index A continue
+                    self.instrs.append({
+                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec),
+                                 ("+", v_node[0], v_node[0], v_one),
+                                 ("+", v_node[1], v_node[1], v_one)]
+                    })
+                    self.instrs.append({
+                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
+                                 ("+", all_idx[g], all_idx[g], v_node[0]),
+                                 ("+", all_idx[g + 1], all_idx[g + 1], v_node[1])]
+                    })
+                elif hi == 2:
+                    # Stage 2 is multiply_add - interleave with Index A compare (if wrap check)
+                    if skip_wrap_check:
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                     ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec)]
+                        })
+                    else:
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                     ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec),
+                                     ("<", v_node[0], all_idx[g], v_n_nodes),
+                                     ("<", v_node[1], all_idx[g + 1], v_n_nodes)]
+                        })
+                elif hi == 3:
+                    # Stage 3 is regular - interleave with Index A mask (if wrap check)
+                    if skip_wrap_check:
                         self.instrs.append({
                             "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
                                      (op3, v_tmp2[2], all_val[g + 2], const3_vec),
                                      (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
-                            "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)]
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
                         })
                         self.instrs.append({
                             "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
-                            "alu": [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(8)]
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
                         })
-                    elif hi == 5 and has_next_group:
+                    else:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
+                                     ("-", v_node[0], v_zero, v_node[0]),
+                                     ("-", v_node[1], v_zero, v_node[1])]
+                        })
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
+                                     ("&", all_idx[g], all_idx[g], v_node[0]),
+                                     ("&", all_idx[g + 1], all_idx[g + 1], v_node[1])]
+                        })
+                elif hi == 4:
+                    # Stage 4 is multiply_add - add address computation for next group
+                    if has_next_group:
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                     ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec)],
+                            "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)] +
+                                   [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(4)]
+                        })
+                    else:
+                        self.instrs.append({
+                            "valu": [("multiply_add", all_val[g + 2], all_val[g + 2], mult_vec, const_vec),
+                                     ("multiply_add", all_val[g + 3], all_val[g + 3], mult_vec, const_vec)]
+                        })
+                elif hi == 5:
+                    # Stage 5 is regular - add address computation for next group
+                    if has_next_group:
                         self.instrs.append({
                             "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
                                      (op3, v_tmp2[2], all_val[g + 2], const3_vec),
                                      (op1, v_tmp1[3], all_val[g + 3], const1_vec),
                                      (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
-                            "alu": [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
+                            "alu": [("+", next_addrs[1] + 4 + vi, fp, all_idx[ng + 1] + 4 + vi) for vi in range(4)] +
+                                   [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
                         })
                         self.instrs.append({
                             "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
@@ -1297,129 +1365,6 @@ class KernelBuilder:
                             "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
                                      (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
                         })
-                elif hi == 0:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                 ("&", v_node[0], all_val[g], v_one),
-                                 ("*", all_idx[g], all_idx[g], v_two)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
-                                 ("&", v_node[1], all_val[g + 1], v_one),
-                                 ("*", all_idx[g + 1], all_idx[g + 1], v_two)]
-                    })
-                elif hi == 1:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                 ("+", v_node[0], v_node[0], v_one),
-                                 ("+", v_node[1], v_node[1], v_one)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
-                                 ("+", all_idx[g], all_idx[g], v_node[0]),
-                                 ("+", all_idx[g + 1], all_idx[g + 1], v_node[1])]
-                    })
-                elif hi == 2:
-                    if skip_wrap_check:
-                        # Skip comparison - just do Hash B
-                        self.instrs.append({
-                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
-                        })
-                        self.instrs.append({
-                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
-                        })
-                    else:
-                        self.instrs.append({
-                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                     ("<", v_node[0], all_idx[g], v_n_nodes),
-                                     ("<", v_node[1], all_idx[g + 1], v_n_nodes)]
-                        })
-                        self.instrs.append({
-                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
-                                     ("-", v_node[0], v_zero, v_node[0]),
-                                     ("-", v_node[1], v_zero, v_node[1])]
-                        })
-                elif hi == 3:
-                    if skip_wrap_check:
-                        # Skip masking - just do Hash B
-                        self.instrs.append({
-                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
-                        })
-                        self.instrs.append({
-                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
-                        })
-                    else:
-                        self.instrs.append({
-                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                     ("&", all_idx[g], all_idx[g], v_node[0]),
-                                     ("&", all_idx[g + 1], all_idx[g + 1], v_node[1])]
-                        })
-                        self.instrs.append({
-                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
-                        })
-                elif hi == 4 and has_next_group:
-                    # Stage 4: add address computation for next group vectors 0,1
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
-                        "alu": [("+", next_addrs[0] + vi, fp, all_idx[ng] + vi) for vi in range(8)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
-                        "alu": [("+", next_addrs[1] + vi, fp, all_idx[ng + 1] + vi) for vi in range(8)]
-                    })
-                elif hi == 5 and has_next_group:
-                    # Stage 5: add address computation for next group vectors 2,3
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
-                        "alu": [("+", next_addrs[2] + vi, fp, all_idx[ng + 2] + vi) for vi in range(8)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
-                        "alu": [("+", next_addrs[3] + vi, fp, all_idx[ng + 3] + vi) for vi in range(8)]
-                    })
-                else:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
-                    })
 
             # Index B - deferred to overlap with next group's Gather A (skip on last round)
             if skip_index:
