@@ -94,11 +94,13 @@ class KernelBuilder:
         all_idx = [self.alloc_scratch(f"idx_{i}", VLEN) for i in range(n_vectors)]
         all_val = [self.alloc_scratch(f"val_{i}", VLEN) for i in range(n_vectors)]
 
-        # Working buffers for 4 vectors per group
+        # Working buffers for 4 vectors per group (two sets for pipelining)
         v_node = [self.alloc_scratch(f"node_{i}", VLEN) for i in range(4)]
         v_tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(4)]
         v_tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(4)]
         v_addrs = [self.alloc_scratch(f"addrs_{i}", VLEN) for i in range(4)]
+        v_node2 = [self.alloc_scratch(f"node2_{i}", VLEN) for i in range(4)]
+        v_addrs2 = [self.alloc_scratch(f"addrs2_{i}", VLEN) for i in range(4)]
 
         # ============ INITIALIZATION ============
         for i, v in enumerate(init_vars):
@@ -162,7 +164,7 @@ class KernelBuilder:
             else:
                 # Full gather for all other rounds
                 self._emit_round_full_gather(
-                    all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
+                    all_idx, all_val, v_node, v_node2, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                     n_vectors, tmp1, skip_index=is_last_round
                 )
@@ -183,12 +185,24 @@ class KernelBuilder:
         self.add("load", ("load", tmp1, self.scratch["forest_values_p"]))
         self.add("valu", ("vbroadcast", v_node[0], tmp1))
 
-        # XOR all vectors with the single node value
-        for vi in range(0, n_vectors, 2):
-            self.instrs.append({
-                "valu": [("^", all_val[vi], all_val[vi], v_node[0]),
-                         ("^", all_val[vi + 1], all_val[vi + 1], v_node[0])]
-            })
+        # XOR all vectors with the single node value (3 at a time to match hash)
+        for vi in range(0, n_vectors, 3):
+            vecs = min(3, n_vectors - vi)
+            if vecs == 3:
+                self.instrs.append({
+                    "valu": [("^", all_val[vi], all_val[vi], v_node[0]),
+                             ("^", all_val[vi + 1], all_val[vi + 1], v_node[0]),
+                             ("^", all_val[vi + 2], all_val[vi + 2], v_node[0])]
+                })
+            elif vecs == 2:
+                self.instrs.append({
+                    "valu": [("^", all_val[vi], all_val[vi], v_node[0]),
+                             ("^", all_val[vi + 1], all_val[vi + 1], v_node[0])]
+                })
+            else:
+                self.instrs.append({
+                    "valu": [("^", all_val[vi], all_val[vi], v_node[0])]
+                })
 
         # Hash all vectors
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
@@ -259,6 +273,304 @@ class KernelBuilder:
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
 
         # Index update all vectors (skip for last round)
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
+
+    def _emit_round_k4_batched(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
+                                hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                                n_vectors, tmp1, tmp2, idx_base, skip_index=False):
+        """k=4 optimization processing 2 vectors at a time for better VALU utilization."""
+        # Load 4 node values
+        for i in range(4):
+            self.add("load", ("const", tmp1, idx_base + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", v_node[i], tmp1))
+
+        idx_base_vec = self.scratch_const_vec(idx_base)
+        v_two_const = self.scratch_const_vec(2)
+
+        # Precompute diffs (reused for all vectors)
+        diff02_addr = self.alloc_scratch("diff02_k4", VLEN)
+        diff13_addr = self.alloc_scratch("diff13_k4", VLEN)
+        self.instrs.append({
+            "valu": [("^", diff02_addr, v_node[0], v_node[2]),
+                     ("^", diff13_addr, v_node[1], v_node[3])]
+        })
+
+        # Process 2 vectors at a time to utilize 6 VALU slots better
+        for vi in range(0, n_vectors, 2):
+            # offset = idx - idx_base for both vectors
+            self.instrs.append({
+                "valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec),
+                         ("-", v_tmp1[1], all_idx[vi+1], idx_base_vec)]
+            })
+            # bit1 = (offset & 2) >> 1, mask1 = 0 - bit1
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], v_tmp1[0], v_two_const),
+                         ("&", v_tmp2[1], v_tmp1[1], v_two_const)]
+            })
+            self.instrs.append({
+                "valu": [(">>", v_tmp2[0], v_tmp2[0], v_one),
+                         (">>", v_tmp2[1], v_tmp2[1], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp2[0], v_zero, v_tmp2[0]),
+                         ("-", v_tmp2[1], v_zero, v_tmp2[1])]
+            })
+            # masked diffs for level 1
+            self.instrs.append({
+                "valu": [("&", v_tmp2[2], diff02_addr, v_tmp2[0]),
+                         ("&", v_tmp2[3], diff13_addr, v_tmp2[0])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[2], v_node[0], v_tmp2[2]),  # sel_low[0]
+                         ("^", v_tmp2[3], v_node[1], v_tmp2[3])]  # sel_high[0]
+            })
+            # For vector 1
+            v_sel_low1 = v_tmp1[2]
+            v_sel_high1 = v_tmp1[3]
+            self.instrs.append({
+                "valu": [("&", v_sel_low1, diff02_addr, v_tmp2[1]),
+                         ("&", v_sel_high1, diff13_addr, v_tmp2[1])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_sel_low1, v_node[0], v_sel_low1),
+                         ("^", v_sel_high1, v_node[1], v_sel_high1)]
+            })
+            # Level 2: bit0 = offset & 1, mask0 = 0 - bit0
+            self.instrs.append({
+                "valu": [("&", v_tmp1[0], v_tmp1[0], v_one),
+                         ("&", v_tmp1[1], v_tmp1[1], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
+                         ("-", v_tmp1[1], v_zero, v_tmp1[1])]
+            })
+            # diff_lowhigh, masked, final select
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], v_tmp2[2], v_tmp2[3]),
+                         ("^", v_tmp2[1], v_sel_low1, v_sel_high1)]
+            })
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[0]),
+                         ("&", v_tmp2[1], v_tmp2[1], v_tmp1[1])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], v_tmp2[2], v_tmp2[0]),
+                         ("^", v_tmp2[1], v_sel_low1, v_tmp2[1])]
+            })
+            # XOR with val
+            self.instrs.append({
+                "valu": [("^", all_val[vi], all_val[vi], v_tmp2[0]),
+                         ("^", all_val[vi+1], all_val[vi+1], v_tmp2[1])]
+            })
+
+        # Hash all vectors
+        self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
+
+        # Index update
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
+
+    def _emit_round_k8_batched(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
+                                hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                                n_vectors, tmp1, tmp2, idx_base, skip_index=False):
+        """k=8 optimization using 3-level binary select."""
+        # Load 8 node values (need more temp storage)
+        node_addrs = [self.alloc_scratch(f"k8_node_{i}", VLEN) for i in range(8)]
+        for i in range(8):
+            self.add("load", ("const", tmp1, idx_base + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", node_addrs[i], tmp1))
+
+        idx_base_vec = self.scratch_const_vec(idx_base)
+        v_four_const = self.scratch_const_vec(4)
+        v_two_const = self.scratch_const_vec(2)
+
+        # Process 1 vector at a time for k=8 (more complex selection)
+        for vi in range(n_vectors):
+            # offset = idx - idx_base (0-7)
+            self.instrs.append({"valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec)]})
+
+            # Level 1: bit2 = (offset & 4) >> 2
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_four_const)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_two_const)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            # Select between (n0-n3) and (n4-n7)
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], node_addrs[0], node_addrs[4]),
+                         ("^", v_tmp2[1], node_addrs[1], node_addrs[5]),
+                         ("^", v_tmp2[2], node_addrs[2], node_addrs[6]),
+                         ("^", v_tmp2[3], node_addrs[3], node_addrs[7])]
+            })
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[1]),
+                         ("&", v_tmp2[1], v_tmp2[1], v_tmp1[1]),
+                         ("&", v_tmp2[2], v_tmp2[2], v_tmp1[1]),
+                         ("&", v_tmp2[3], v_tmp2[3], v_tmp1[1])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], node_addrs[0], v_tmp2[0]),  # n0 or n4
+                         ("^", v_tmp2[1], node_addrs[1], v_tmp2[1]),  # n1 or n5
+                         ("^", v_tmp2[2], node_addrs[2], v_tmp2[2]),  # n2 or n6
+                         ("^", v_tmp2[3], node_addrs[3], v_tmp2[3])]  # n3 or n7
+            })
+
+            # Level 2: bit1 = (offset & 2) >> 1
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_two_const)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            # Select between pairs
+            sel_02 = v_tmp1[2]
+            sel_13 = v_tmp1[3]
+            self.instrs.append({
+                "valu": [("^", sel_02, v_tmp2[0], v_tmp2[2]),
+                         ("^", sel_13, v_tmp2[1], v_tmp2[3])]
+            })
+            self.instrs.append({
+                "valu": [("&", sel_02, sel_02, v_tmp1[1]),
+                         ("&", sel_13, sel_13, v_tmp1[1])]
+            })
+            self.instrs.append({
+                "valu": [("^", sel_02, v_tmp2[0], sel_02),  # low
+                         ("^", sel_13, v_tmp2[1], sel_13)]  # high
+            })
+
+            # Level 3: bit0 = offset & 1
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            self.instrs.append({"valu": [("^", v_tmp2[0], sel_02, sel_13)]})
+            self.instrs.append({"valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[1])]})
+            self.instrs.append({"valu": [("^", v_tmp2[0], sel_02, v_tmp2[0])]})
+
+            # XOR with val
+            self.instrs.append({"valu": [("^", all_val[vi], all_val[vi], v_tmp2[0])]})
+
+        # Hash all vectors
+        self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
+
+        # Index update
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
+
+    def _emit_round_k16_batched(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
+                                 hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                                 n_vectors, tmp1, tmp2, idx_base, skip_index=False):
+        """k=16 optimization using 4-level binary select."""
+        # Load 16 node values
+        node_addrs = [self.alloc_scratch(f"k16_node_{i}", VLEN) for i in range(16)]
+        for i in range(16):
+            self.add("load", ("const", tmp1, idx_base + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", node_addrs[i], tmp1))
+
+        idx_base_vec = self.scratch_const_vec(idx_base)
+        v_eight_const = self.scratch_const_vec(8)
+        v_four_const = self.scratch_const_vec(4)
+        v_two_const = self.scratch_const_vec(2)
+
+        # Allocate additional working space for 8 intermediate values
+        sel_level1 = [self.alloc_scratch(f"k16_sel1_{i}", VLEN) for i in range(8)]
+
+        # Process 1 vector at a time
+        for vi in range(n_vectors):
+            # offset = idx - idx_base (0-15)
+            self.instrs.append({"valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec)]})
+
+            # Level 1: bit3 = (offset & 8) >> 3
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_eight_const)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_one)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_one)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            # Select between (n0-n7) and (n8-n15)
+            for i in range(0, 8, 4):
+                self.instrs.append({
+                    "valu": [("^", v_tmp2[0], node_addrs[i], node_addrs[i+8]),
+                             ("^", v_tmp2[1], node_addrs[i+1], node_addrs[i+9]),
+                             ("^", v_tmp2[2], node_addrs[i+2], node_addrs[i+10]),
+                             ("^", v_tmp2[3], node_addrs[i+3], node_addrs[i+11])]
+                })
+                self.instrs.append({
+                    "valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[1]),
+                             ("&", v_tmp2[1], v_tmp2[1], v_tmp1[1]),
+                             ("&", v_tmp2[2], v_tmp2[2], v_tmp1[1]),
+                             ("&", v_tmp2[3], v_tmp2[3], v_tmp1[1])]
+                })
+                self.instrs.append({
+                    "valu": [("^", sel_level1[i], node_addrs[i], v_tmp2[0]),
+                             ("^", sel_level1[i+1], node_addrs[i+1], v_tmp2[1]),
+                             ("^", sel_level1[i+2], node_addrs[i+2], v_tmp2[2]),
+                             ("^", sel_level1[i+3], node_addrs[i+3], v_tmp2[3])]
+                })
+
+            # Level 2: bit2 = (offset & 4) >> 2
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_four_const)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_two_const)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            # Select between pairs of 4
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], sel_level1[0], sel_level1[4]),
+                         ("^", v_tmp2[1], sel_level1[1], sel_level1[5]),
+                         ("^", v_tmp2[2], sel_level1[2], sel_level1[6]),
+                         ("^", v_tmp2[3], sel_level1[3], sel_level1[7])]
+            })
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[1]),
+                         ("&", v_tmp2[1], v_tmp2[1], v_tmp1[1]),
+                         ("&", v_tmp2[2], v_tmp2[2], v_tmp1[1]),
+                         ("&", v_tmp2[3], v_tmp2[3], v_tmp1[1])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], sel_level1[0], v_tmp2[0]),
+                         ("^", v_tmp2[1], sel_level1[1], v_tmp2[1]),
+                         ("^", v_tmp2[2], sel_level1[2], v_tmp2[2]),
+                         ("^", v_tmp2[3], sel_level1[3], v_tmp2[3])]
+            })
+
+            # Level 3: bit1 = (offset & 2) >> 1
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_two_const)]})
+            self.instrs.append({"valu": [(">>", v_tmp1[1], v_tmp1[1], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            sel_02 = v_tmp1[2]
+            sel_13 = v_tmp1[3]
+            self.instrs.append({
+                "valu": [("^", sel_02, v_tmp2[0], v_tmp2[2]),
+                         ("^", sel_13, v_tmp2[1], v_tmp2[3])]
+            })
+            self.instrs.append({
+                "valu": [("&", sel_02, sel_02, v_tmp1[1]),
+                         ("&", sel_13, sel_13, v_tmp1[1])]
+            })
+            self.instrs.append({
+                "valu": [("^", sel_02, v_tmp2[0], sel_02),
+                         ("^", sel_13, v_tmp2[1], sel_13)]
+            })
+
+            # Level 4: bit0 = offset & 1
+            self.instrs.append({"valu": [("&", v_tmp1[1], v_tmp1[0], v_one)]})
+            self.instrs.append({"valu": [("-", v_tmp1[1], v_zero, v_tmp1[1])]})
+
+            self.instrs.append({"valu": [("^", v_tmp2[0], sel_02, sel_13)]})
+            self.instrs.append({"valu": [("&", v_tmp2[0], v_tmp2[0], v_tmp1[1])]})
+            self.instrs.append({"valu": [("^", v_tmp2[0], sel_02, v_tmp2[0])]})
+
+            # XOR with val
+            self.instrs.append({"valu": [("^", all_val[vi], all_val[vi], v_tmp2[0])]})
+
+        # Hash all vectors
+        self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
+
+        # Index update
         if not skip_index:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
 
@@ -495,12 +807,19 @@ class KernelBuilder:
         self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors)
 
     def _emit_hash_all(self, all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors):
-        """Hash all vectors, 3 at a time."""
-        for vi in range(0, n_vectors, 3):
-            vecs = min(3, n_vectors - vi)
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                const1, const3 = hash_const_vecs[hi]
-                if vecs == 3:
+        """Hash all vectors with interleaved groups for better VALU utilization.
+        Process 6 vectors at a time: 2 groups of 3, combining their combine steps."""
+        # Allocate extra temp storage for second group
+        v_tmp3 = [self.alloc_scratch(f"htmp3_{i}", VLEN) for i in range(3)]
+        v_tmp4 = [self.alloc_scratch(f"htmp4_{i}", VLEN) for i in range(3)]
+
+        for vi in range(0, n_vectors, 6):
+            remaining = n_vectors - vi
+            if remaining >= 6:
+                # Process 2 groups of 3 vectors interleaved
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    const1, const3 = hash_const_vecs[hi]
+                    # Group A first (vectors vi, vi+1, vi+2)
                     self.instrs.append({
                         "valu": [(op1, v_tmp1[0], all_val[vi], const1),
                                  (op3, v_tmp2[0], all_val[vi], const3),
@@ -509,97 +828,214 @@ class KernelBuilder:
                                  (op1, v_tmp1[2], all_val[vi+2], const1),
                                  (op3, v_tmp2[2], all_val[vi+2], const3)]
                     })
+                    # Group B first (vectors vi+3, vi+4, vi+5)
+                    self.instrs.append({
+                        "valu": [(op1, v_tmp3[0], all_val[vi+3], const1),
+                                 (op3, v_tmp4[0], all_val[vi+3], const3),
+                                 (op1, v_tmp3[1], all_val[vi+4], const1),
+                                 (op3, v_tmp4[1], all_val[vi+4], const3),
+                                 (op1, v_tmp3[2], all_val[vi+5], const1),
+                                 (op3, v_tmp4[2], all_val[vi+5], const3)]
+                    })
+                    # Both groups combine (6 VALU slots fully utilized)
                     self.instrs.append({
                         "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0]),
                                  (op2, all_val[vi+1], v_tmp1[1], v_tmp2[1]),
-                                 (op2, all_val[vi+2], v_tmp1[2], v_tmp2[2])]
+                                 (op2, all_val[vi+2], v_tmp1[2], v_tmp2[2]),
+                                 (op2, all_val[vi+3], v_tmp3[0], v_tmp4[0]),
+                                 (op2, all_val[vi+4], v_tmp3[1], v_tmp4[1]),
+                                 (op2, all_val[vi+5], v_tmp3[2], v_tmp4[2])]
                     })
-                elif vecs == 2:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[0], all_val[vi], const1),
-                                 (op3, v_tmp2[0], all_val[vi], const3),
-                                 (op1, v_tmp1[1], all_val[vi+1], const1),
-                                 (op3, v_tmp2[1], all_val[vi+1], const3)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0]),
-                                 (op2, all_val[vi+1], v_tmp1[1], v_tmp2[1])]
-                    })
-                else:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[0], all_val[vi], const1),
-                                 (op3, v_tmp2[0], all_val[vi], const3)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[vi], v_tmp1[0], v_tmp2[0])]
-                    })
+            else:
+                # Handle remaining vectors with original approach
+                for vii in range(vi, n_vectors, 3):
+                    vecs = min(3, n_vectors - vii)
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        const1, const3 = hash_const_vecs[hi]
+                        if vecs == 3:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[0], all_val[vii], const1),
+                                         (op3, v_tmp2[0], all_val[vii], const3),
+                                         (op1, v_tmp1[1], all_val[vii+1], const1),
+                                         (op3, v_tmp2[1], all_val[vii+1], const3),
+                                         (op1, v_tmp1[2], all_val[vii+2], const1),
+                                         (op3, v_tmp2[2], all_val[vii+2], const3)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[vii], v_tmp1[0], v_tmp2[0]),
+                                         (op2, all_val[vii+1], v_tmp1[1], v_tmp2[1]),
+                                         (op2, all_val[vii+2], v_tmp1[2], v_tmp2[2])]
+                            })
+                        elif vecs == 2:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[0], all_val[vii], const1),
+                                         (op3, v_tmp2[0], all_val[vii], const3),
+                                         (op1, v_tmp1[1], all_val[vii+1], const1),
+                                         (op3, v_tmp2[1], all_val[vii+1], const3)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[vii], v_tmp1[0], v_tmp2[0]),
+                                         (op2, all_val[vii+1], v_tmp1[1], v_tmp2[1])]
+                            })
+                        else:
+                            self.instrs.append({
+                                "valu": [(op1, v_tmp1[0], all_val[vii], const1),
+                                         (op3, v_tmp2[0], all_val[vii], const3)]
+                            })
+                            self.instrs.append({
+                                "valu": [(op2, all_val[vii], v_tmp1[0], v_tmp2[0])]
+                            })
 
     def _emit_index_all(self, all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors):
-        """Index update all vectors, 2 at a time."""
-        for vi in range(0, n_vectors, 2):
+        """Index update all vectors, 3 at a time for better VALU utilization."""
+        # Allocate extra temp storage for third vector
+        v_tmp3 = self.alloc_scratch("idx_tmp3", VLEN)
+
+        for vi in range(0, n_vectors, 3):
+            vecs = min(3, n_vectors - vi)
             # new_idx = old_idx * 2 + (val & 1) + 1
             # if new_idx >= n_nodes: new_idx = 0
-            self.instrs.append({
-                "valu": [("&", v_tmp1[0], all_val[vi], v_one),
-                         ("*", all_idx[vi], all_idx[vi], v_two),
-                         ("&", v_tmp1[1], all_val[vi+1], v_one),
-                         ("*", all_idx[vi+1], all_idx[vi+1], v_two)]
-            })
-            self.instrs.append({
-                "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
-                         ("+", v_tmp1[1], v_tmp1[1], v_one)]
-            })
-            self.instrs.append({
-                "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
-                         ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
-            })
-            self.instrs.append({
-                "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes),
-                         ("<", v_tmp1[1], all_idx[vi+1], v_n_nodes)]
-            })
-            self.instrs.append({
-                "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
-                         ("-", v_tmp1[1], v_zero, v_tmp1[1])]
-            })
-            self.instrs.append({
-                "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0]),
-                         ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
-            })
+            if vecs == 3:
+                self.instrs.append({
+                    "valu": [("&", v_tmp1[0], all_val[vi], v_one),
+                             ("*", all_idx[vi], all_idx[vi], v_two),
+                             ("&", v_tmp1[1], all_val[vi+1], v_one),
+                             ("*", all_idx[vi+1], all_idx[vi+1], v_two),
+                             ("&", v_tmp3, all_val[vi+2], v_one),
+                             ("*", all_idx[vi+2], all_idx[vi+2], v_two)]
+                })
+                self.instrs.append({
+                    "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
+                             ("+", v_tmp1[1], v_tmp1[1], v_one),
+                             ("+", v_tmp3, v_tmp3, v_one)]
+                })
+                self.instrs.append({
+                    "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
+                             ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1]),
+                             ("+", all_idx[vi+2], all_idx[vi+2], v_tmp3)]
+                })
+                self.instrs.append({
+                    "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes),
+                             ("<", v_tmp1[1], all_idx[vi+1], v_n_nodes),
+                             ("<", v_tmp3, all_idx[vi+2], v_n_nodes)]
+                })
+                self.instrs.append({
+                    "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
+                             ("-", v_tmp1[1], v_zero, v_tmp1[1]),
+                             ("-", v_tmp3, v_zero, v_tmp3)]
+                })
+                self.instrs.append({
+                    "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0]),
+                             ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1]),
+                             ("&", all_idx[vi+2], all_idx[vi+2], v_tmp3)]
+                })
+            elif vecs == 2:
+                self.instrs.append({
+                    "valu": [("&", v_tmp1[0], all_val[vi], v_one),
+                             ("*", all_idx[vi], all_idx[vi], v_two),
+                             ("&", v_tmp1[1], all_val[vi+1], v_one),
+                             ("*", all_idx[vi+1], all_idx[vi+1], v_two)]
+                })
+                self.instrs.append({
+                    "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
+                             ("+", v_tmp1[1], v_tmp1[1], v_one)]
+                })
+                self.instrs.append({
+                    "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
+                             ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
+                })
+                self.instrs.append({
+                    "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes),
+                             ("<", v_tmp1[1], all_idx[vi+1], v_n_nodes)]
+                })
+                self.instrs.append({
+                    "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0]),
+                             ("-", v_tmp1[1], v_zero, v_tmp1[1])]
+                })
+                self.instrs.append({
+                    "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0]),
+                             ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
+                })
+            else:
+                self.instrs.append({
+                    "valu": [("&", v_tmp1[0], all_val[vi], v_one),
+                             ("*", all_idx[vi], all_idx[vi], v_two)]
+                })
+                self.instrs.append({
+                    "valu": [("+", v_tmp1[0], v_tmp1[0], v_one)]
+                })
+                self.instrs.append({
+                    "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0])]
+                })
+                self.instrs.append({
+                    "valu": [("<", v_tmp1[0], all_idx[vi], v_n_nodes)]
+                })
+                self.instrs.append({
+                    "valu": [("-", v_tmp1[0], v_zero, v_tmp1[0])]
+                })
+                self.instrs.append({
+                    "valu": [("&", all_idx[vi], all_idx[vi], v_tmp1[0])]
+                })
 
-    def _emit_round_full_gather(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs,
+    def _emit_round_full_gather(self, all_idx, all_val, v_node, v_node2, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                                  hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                                  n_vectors, tmp1, skip_index=False):
-        """Full gather round with pipelining (from working baseline).
-        Note: skip_index not implemented for full gather due to complex interleaving."""
+        """Full gather round with aggressive inter-group pipelining.
+        Overlaps gather of next group with hash/index of current group."""
         n_groups = n_vectors // 4  # 8 groups
 
+        # Track whether we've pre-computed addresses for next group
+        next_group_addrs_ready = False
+
+        # Process groups with inter-group pipelining
         for group_idx in range(n_groups):
             g = group_idx * 4
+            cur_addrs = v_addrs if (group_idx % 2 == 0) else v_addrs2
+            cur_node = v_node if (group_idx % 2 == 0) else v_node2
+            next_addrs = v_addrs2 if (group_idx % 2 == 0) else v_addrs
+            next_node = v_node2 if (group_idx % 2 == 0) else v_node
 
-            # Compute addresses for all 4 vectors
-            for v in range(4):
+            # Compute addresses for current group (skip if pre-computed from previous group)
+            if not next_group_addrs_ready:
+                # Vector 0 (8 ops) + Vector 1 first 4 ops = 12 ops
                 self.instrs.append({
-                    "alu": [("+", v_addrs[v] + vi, self.scratch["forest_values_p"], all_idx[g + v] + vi)
+                    "alu": [("+", cur_addrs[0] + vi, self.scratch["forest_values_p"], all_idx[g] + vi)
+                            for vi in range(VLEN)] +
+                           [("+", cur_addrs[1] + vi, self.scratch["forest_values_p"], all_idx[g + 1] + vi)
+                            for vi in range(4)]
+                })
+                # Vector 1 last 4 + Vector 2 (8 ops) = 12 ops
+                self.instrs.append({
+                    "alu": [("+", cur_addrs[1] + vi, self.scratch["forest_values_p"], all_idx[g + 1] + vi)
+                            for vi in range(4, VLEN)] +
+                           [("+", cur_addrs[2] + vi, self.scratch["forest_values_p"], all_idx[g + 2] + vi)
                             for vi in range(VLEN)]
                 })
+                # Vector 3 (8 ops)
+                self.instrs.append({
+                    "alu": [("+", cur_addrs[3] + vi, self.scratch["forest_values_p"], all_idx[g + 3] + vi)
+                            for vi in range(VLEN)]
+                })
+            next_group_addrs_ready = False  # Reset for next iteration
 
-            # Gather A (vec 0,1)
+            # Gather A (vec 0,1) for current group
             for vi in range(VLEN):
                 self.instrs.append({
-                    "load": [("load", v_node[0] + vi, v_addrs[0] + vi),
-                             ("load", v_node[1] + vi, v_addrs[1] + vi)]
+                    "load": [("load", cur_node[0] + vi, cur_addrs[0] + vi),
+                             ("load", cur_node[1] + vi, cur_addrs[1] + vi)]
                 })
-
             # XOR A
             self.instrs.append({
-                "valu": [("^", all_val[g], all_val[g], v_node[0]),
-                         ("^", all_val[g + 1], all_val[g + 1], v_node[1])]
+                "valu": [("^", all_val[g], all_val[g], cur_node[0]),
+                         ("^", all_val[g + 1], all_val[g + 1], cur_node[1])]
             })
 
-            # Hash A + Gather B overlapped
+            # Hash A + Gather B overlapped, fuse XOR B with last combine
             load_idx = 0
+            num_stages = len(HASH_STAGES)
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 const1_vec, const3_vec = hash_const_vecs[hi]
+                is_last_stage = (hi == num_stages - 1)
 
                 vi = load_idx
                 if vi < VLEN:
@@ -608,8 +1044,8 @@ class KernelBuilder:
                                  (op3, v_tmp2[0], all_val[g], const3_vec),
                                  (op1, v_tmp1[1], all_val[g + 1], const1_vec),
                                  (op3, v_tmp2[1], all_val[g + 1], const3_vec)],
-                        "load": [("load", v_node[2] + vi, v_addrs[2] + vi),
-                                 ("load", v_node[3] + vi, v_addrs[3] + vi)]
+                        "load": [("load", cur_node[2] + vi, cur_addrs[2] + vi),
+                                 ("load", cur_node[3] + vi, cur_addrs[3] + vi)]
                     })
                     load_idx += 1
                 else:
@@ -625,10 +1061,18 @@ class KernelBuilder:
                     self.instrs.append({
                         "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
                                  (op2, all_val[g + 1], v_tmp1[1], v_tmp2[1])],
-                        "load": [("load", v_node[2] + vi, v_addrs[2] + vi),
-                                 ("load", v_node[3] + vi, v_addrs[3] + vi)]
+                        "load": [("load", cur_node[2] + vi, cur_addrs[2] + vi),
+                                 ("load", cur_node[3] + vi, cur_addrs[3] + vi)]
                     })
                     load_idx += 1
+                elif is_last_stage:
+                    # Fuse XOR B with last hash A combine (saves 1 instruction)
+                    self.instrs.append({
+                        "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
+                                 (op2, all_val[g + 1], v_tmp1[1], v_tmp2[1]),
+                                 ("^", all_val[g + 2], all_val[g + 2], cur_node[2]),
+                                 ("^", all_val[g + 3], all_val[g + 3], cur_node[3])]
+                    })
                 else:
                     self.instrs.append({
                         "valu": [(op2, all_val[g], v_tmp1[0], v_tmp2[0]),
@@ -637,65 +1081,147 @@ class KernelBuilder:
 
             while load_idx < VLEN:
                 self.instrs.append({
-                    "load": [("load", v_node[2] + load_idx, v_addrs[2] + load_idx),
-                             ("load", v_node[3] + load_idx, v_addrs[3] + load_idx)]
+                    "load": [("load", cur_node[2] + load_idx, cur_addrs[2] + load_idx),
+                             ("load", cur_node[3] + load_idx, cur_addrs[3] + load_idx)]
                 })
                 load_idx += 1
 
-            # XOR B
-            self.instrs.append({
-                "valu": [("^", all_val[g + 2], all_val[g + 2], v_node[2]),
-                         ("^", all_val[g + 3], all_val[g + 3], v_node[3])]
-            })
+            # XOR B already fused above if all loads completed during hash A
 
-            # Hash B + Index A
+            # Hash B + Index A + Addr comp for next group
+            next_g = g + 4
+            next_addr_v = 0
+            next_addr_vi = 0
+            has_next = (group_idx < n_groups - 1)
+
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 const1_vec, const3_vec = hash_const_vecs[hi]
 
-                if hi == 0:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                 ("&", v_node[0], all_val[g], v_one),
-                                 ("*", all_idx[g], all_idx[g], v_two)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
-                                 ("&", v_node[1], all_val[g + 1], v_one),
-                                 ("*", all_idx[g + 1], all_idx[g + 1], v_two)]
-                    })
+                if skip_index:
+                    # Skip index update for last round
+                    if has_next and next_addr_v < 4:
+                        # Overlap addr comp for next group with ALU
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)],
+                            "alu": [("+", next_addrs[next_addr_v] + vi, self.scratch["forest_values_p"], all_idx[next_g + next_addr_v] + vi)
+                                    for vi in range(VLEN)]
+                        })
+                        next_addr_v += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec)]
+                        })
+                    if has_next and next_addr_v < 4:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])],
+                            "alu": [("+", next_addrs[next_addr_v] + vi, self.scratch["forest_values_p"], all_idx[next_g + next_addr_v] + vi)
+                                    for vi in range(VLEN)]
+                        })
+                        next_addr_v += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
+                        })
+                elif hi == 0:
+                    if has_next and next_addr_v < 4:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
+                                     ("&", cur_node[0], all_val[g], v_one),
+                                     ("*", all_idx[g], all_idx[g], v_two)],
+                            "alu": [("+", next_addrs[next_addr_v] + vi, self.scratch["forest_values_p"], all_idx[next_g + next_addr_v] + vi)
+                                    for vi in range(VLEN)]
+                        })
+                        next_addr_v += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
+                                     ("&", cur_node[0], all_val[g], v_one),
+                                     ("*", all_idx[g], all_idx[g], v_two)]
+                        })
+                    if has_next and next_addr_v < 4:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
+                                     ("&", cur_node[1], all_val[g + 1], v_one),
+                                     ("*", all_idx[g + 1], all_idx[g + 1], v_two)],
+                            "alu": [("+", next_addrs[next_addr_v] + vi, self.scratch["forest_values_p"], all_idx[next_g + next_addr_v] + vi)
+                                    for vi in range(VLEN)]
+                        })
+                        next_addr_v += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
+                                     ("&", cur_node[1], all_val[g + 1], v_one),
+                                     ("*", all_idx[g + 1], all_idx[g + 1], v_two)]
+                        })
                 elif hi == 1:
-                    self.instrs.append({
-                        "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
-                                 (op3, v_tmp2[2], all_val[g + 2], const3_vec),
-                                 (op1, v_tmp1[3], all_val[g + 3], const1_vec),
-                                 (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                 ("+", v_node[0], v_node[0], v_one),
-                                 ("+", v_node[1], v_node[1], v_one)]
-                    })
-                    self.instrs.append({
-                        "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
-                                 (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
-                                 ("+", all_idx[g], all_idx[g], v_node[0]),
-                                 ("+", all_idx[g + 1], all_idx[g + 1], v_node[1])]
-                    })
+                    if has_next and next_addr_v < 4:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
+                                     ("+", cur_node[0], cur_node[0], v_one),
+                                     ("+", cur_node[1], cur_node[1], v_one)],
+                            "alu": [("+", next_addrs[next_addr_v] + vi, self.scratch["forest_values_p"], all_idx[next_g + next_addr_v] + vi)
+                                    for vi in range(VLEN)]
+                        })
+                        next_addr_v += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
+                                     (op3, v_tmp2[2], all_val[g + 2], const3_vec),
+                                     (op1, v_tmp1[3], all_val[g + 3], const1_vec),
+                                     (op3, v_tmp2[3], all_val[g + 3], const3_vec),
+                                     ("+", cur_node[0], cur_node[0], v_one),
+                                     ("+", cur_node[1], cur_node[1], v_one)]
+                        })
+                    if has_next and next_addr_v < 4:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
+                                     ("+", all_idx[g], all_idx[g], cur_node[0]),
+                                     ("+", all_idx[g + 1], all_idx[g + 1], cur_node[1])],
+                            "alu": [("+", next_addrs[next_addr_v] + vi, self.scratch["forest_values_p"], all_idx[next_g + next_addr_v] + vi)
+                                    for vi in range(VLEN)]
+                        })
+                        next_addr_v += 1
+                    else:
+                        self.instrs.append({
+                            "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
+                                     (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
+                                     ("+", all_idx[g], all_idx[g], cur_node[0]),
+                                     ("+", all_idx[g + 1], all_idx[g + 1], cur_node[1])]
+                        })
                 elif hi == 2:
                     self.instrs.append({
                         "valu": [(op1, v_tmp1[2], all_val[g + 2], const1_vec),
                                  (op3, v_tmp2[2], all_val[g + 2], const3_vec),
                                  (op1, v_tmp1[3], all_val[g + 3], const1_vec),
                                  (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                 ("<", v_node[0], all_idx[g], v_n_nodes),
-                                 ("<", v_node[1], all_idx[g + 1], v_n_nodes)]
+                                 ("<", cur_node[0], all_idx[g], v_n_nodes),
+                                 ("<", cur_node[1], all_idx[g + 1], v_n_nodes)]
                     })
                     self.instrs.append({
                         "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
                                  (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3]),
-                                 ("-", v_node[0], v_zero, v_node[0]),
-                                 ("-", v_node[1], v_zero, v_node[1])]
+                                 ("-", cur_node[0], v_zero, cur_node[0]),
+                                 ("-", cur_node[1], v_zero, cur_node[1])]
                     })
                 elif hi == 3:
                     self.instrs.append({
@@ -703,8 +1229,8 @@ class KernelBuilder:
                                  (op3, v_tmp2[2], all_val[g + 2], const3_vec),
                                  (op1, v_tmp1[3], all_val[g + 3], const1_vec),
                                  (op3, v_tmp2[3], all_val[g + 3], const3_vec),
-                                 ("&", all_idx[g], all_idx[g], v_node[0]),
-                                 ("&", all_idx[g + 1], all_idx[g + 1], v_node[1])]
+                                 ("&", all_idx[g], all_idx[g], cur_node[0]),
+                                 ("&", all_idx[g + 1], all_idx[g + 1], cur_node[1])]
                     })
                     self.instrs.append({
                         "valu": [(op2, all_val[g + 2], v_tmp1[2], v_tmp2[2]),
@@ -722,33 +1248,38 @@ class KernelBuilder:
                                  (op2, all_val[g + 3], v_tmp1[3], v_tmp2[3])]
                     })
 
-            # Index B
-            self.instrs.append({
-                "valu": [("&", v_tmp1[2], all_val[g + 2], v_one),
-                         ("*", all_idx[g + 2], all_idx[g + 2], v_two),
-                         ("&", v_tmp1[3], all_val[g + 3], v_one),
-                         ("*", all_idx[g + 3], all_idx[g + 3], v_two)]
-            })
-            self.instrs.append({
-                "valu": [("+", v_tmp1[2], v_tmp1[2], v_one),
-                         ("+", v_tmp1[3], v_tmp1[3], v_one)]
-            })
-            self.instrs.append({
-                "valu": [("+", all_idx[g + 2], all_idx[g + 2], v_tmp1[2]),
-                         ("+", all_idx[g + 3], all_idx[g + 3], v_tmp1[3])]
-            })
-            self.instrs.append({
-                "valu": [("<", v_tmp1[2], all_idx[g + 2], v_n_nodes),
-                         ("<", v_tmp1[3], all_idx[g + 3], v_n_nodes)]
-            })
-            self.instrs.append({
-                "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
-                         ("-", v_tmp1[3], v_zero, v_tmp1[3])]
-            })
-            self.instrs.append({
-                "valu": [("&", all_idx[g + 2], all_idx[g + 2], v_tmp1[2]),
-                         ("&", all_idx[g + 3], all_idx[g + 3], v_tmp1[3])]
-            })
+            # Mark if we've pre-computed addresses for next group
+            if has_next and next_addr_v >= 4:
+                next_group_addrs_ready = True
+
+            # Index B (skip for last round)
+            if not skip_index:
+                self.instrs.append({
+                    "valu": [("&", v_tmp1[2], all_val[g + 2], v_one),
+                             ("*", all_idx[g + 2], all_idx[g + 2], v_two),
+                             ("&", v_tmp1[3], all_val[g + 3], v_one),
+                             ("*", all_idx[g + 3], all_idx[g + 3], v_two)]
+                })
+                self.instrs.append({
+                    "valu": [("+", v_tmp1[2], v_tmp1[2], v_one),
+                             ("+", v_tmp1[3], v_tmp1[3], v_one)]
+                })
+                self.instrs.append({
+                    "valu": [("+", all_idx[g + 2], all_idx[g + 2], v_tmp1[2]),
+                             ("+", all_idx[g + 3], all_idx[g + 3], v_tmp1[3])]
+                })
+                self.instrs.append({
+                    "valu": [("<", v_tmp1[2], all_idx[g + 2], v_n_nodes),
+                             ("<", v_tmp1[3], all_idx[g + 3], v_n_nodes)]
+                })
+                self.instrs.append({
+                    "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
+                             ("-", v_tmp1[3], v_zero, v_tmp1[3])]
+                })
+                self.instrs.append({
+                    "valu": [("&", all_idx[g + 2], all_idx[g + 2], v_tmp1[2]),
+                             ("&", all_idx[g + 3], all_idx[g + 3], v_tmp1[3])]
+                })
 
 
 BASELINE = 147734
