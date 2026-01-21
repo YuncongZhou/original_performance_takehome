@@ -933,13 +933,16 @@ class KernelBuilder:
                     })
 
             # XOR A
+            # XOR A + start Gather B (overlap to save 1 instruction)
             self.instrs.append({
                 "valu": [("^", all_val[g], all_val[g], v_node[0]),
-                         ("^", all_val[g + 1], all_val[g + 1], v_node[1])]
+                         ("^", all_val[g + 1], all_val[g + 1], v_node[1])],
+                "load": [("load", v_node[2] + 0, cur_addrs[2] + 0),
+                         ("load", v_node[3] + 0, cur_addrs[3] + 0)]
             })
 
-            # Hash A + Gather B overlapped
-            load_idx = 0
+            # Hash A + Gather B overlapped (start from load_idx=1)
+            load_idx = 1
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 const1_vec, const3_vec = hash_const_vecs[hi]
 
