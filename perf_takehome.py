@@ -179,7 +179,8 @@ class KernelBuilder:
                     skip_wrap_check=not needs_wrap_check
                 )
             else:
-                # Full gather for all other rounds
+                # Full gather for all rounds with 4+ unique indices
+                # k=4 selection overhead exceeds load savings
                 self._emit_round_full_gather(
                     all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
@@ -290,6 +291,183 @@ class KernelBuilder:
                 self.instrs.append({
                     "valu": [("^", all_val[vi+j], all_val[vi+j], tmps[j]) for j in range(vecs)]
                 })
+
+        # Hash all vectors
+        self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
+
+        # Index update all vectors (skip for last round)
+        if not skip_index:
+            self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
+                                 skip_wrap_check=skip_wrap_check)
+
+    def _emit_round_k4_optimized_v2(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
+                                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
+                                     n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
+        """Emit round with k=4 unique indices using VALU-based 2-level binary selection.
+
+        For tree level 2, indices are in {3, 4, 5, 6} = idx_base + {0, 1, 2, 3}.
+        Uses two-level binary selection: first select between (n0,n1) vs (n2,n3) based on bit 1,
+        then select between the results based on bit 0.
+        """
+        # Load 4 node values
+        for i in range(4):
+            self.add("load", ("const", tmp1, idx_base + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", v_node[i], tmp1))
+
+        # Create vector constants
+        idx_base_vec = self.scratch_const_vec(idx_base)
+        v_two_const = self.scratch_const_vec(2)
+
+        # Precompute diffs (reused for all vectors)
+        # diff02 = node[0] ^ node[2], diff13 = node[1] ^ node[3]
+        diff02 = v_tmp2[2]
+        diff13 = v_tmp2[3]
+        self.instrs.append({
+            "valu": [("^", diff02, v_node[0], v_node[2]),
+                     ("^", diff13, v_node[1], v_node[3])]
+        })
+
+        # Process 4 vectors at a time for efficiency
+        for vi in range(0, n_vectors, 4):
+            vecs = min(4, n_vectors - vi)
+
+            if vecs == 4:
+                # offset = idx - idx_base (0-3) for 4 vectors
+                self.instrs.append({
+                    "valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec),
+                             ("-", v_tmp1[1], all_idx[vi+1], idx_base_vec),
+                             ("-", v_tmp1[2], all_idx[vi+2], idx_base_vec),
+                             ("-", v_tmp1[3], all_idx[vi+3], idx_base_vec)]
+                })
+
+                # Level 1: bit1 = (offset >> 1), mask1 = 0 - bit1
+                # bit1 is 0 for offsets 0,1 and 1 for offsets 2,3
+                self.instrs.append({
+                    "valu": [(">>", v_node[0], v_tmp1[0], v_one),
+                             (">>", v_node[1], v_tmp1[1], v_one),
+                             (">>", v_node[2], v_tmp1[2], v_one),
+                             (">>", v_node[3], v_tmp1[3], v_one)]
+                })
+                self.instrs.append({
+                    "valu": [("-", v_node[0], v_zero, v_node[0]),
+                             ("-", v_node[1], v_zero, v_node[1]),
+                             ("-", v_node[2], v_zero, v_node[2]),
+                             ("-", v_node[3], v_zero, v_node[3])]
+                })
+
+                # sel_low = n0 ^ (diff02 & mask1) for 4 vectors
+                # Using tmp1 as intermediate since we still need offset in v_tmp1
+                self.instrs.append({
+                    "valu": [("&", v_node[0], diff02, v_node[0]),
+                             ("&", v_node[1], diff02, v_node[1]),
+                             ("&", v_node[2], diff02, v_node[2]),
+                             ("&", v_node[3], diff02, v_node[3])]
+                })
+                # We need to reload n0 base value - store sel_low separately
+                # Actually, let's store sel_low result back to v_node and reconstruct
+
+                # Reload base values since we've overwritten them
+                self.add("load", ("const", tmp1, idx_base))
+                self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+                self.add("load", ("load", tmp1, tmp1))
+                # XOR with n0 to get sel_low
+                scalar_n0 = tmp1
+                self.instrs.append({
+                    "valu": [("^", v_node[0], v_node[0], self.scratch_const_vec(0)),  # This won't work...
+                    ]
+                })
+
+            # This is getting too complex. Let me simplify by processing 2 vectors at a time.
+
+        # Actually, let me use a simpler approach: process 2 vectors at a time with proper buffer management
+        # Reset and try simpler approach
+
+        # Reload node values since they got corrupted above
+        for i in range(4):
+            self.add("load", ("const", tmp1, idx_base + i))
+            self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
+            self.add("load", ("load", tmp1, tmp1))
+            self.add("valu", ("vbroadcast", v_node[i], tmp1))
+
+        # Process 2 vectors at a time (simple but correct approach)
+        for vi in range(0, n_vectors, 2):
+            # offset = idx - idx_base (0-3) for 2 vectors
+            self.instrs.append({
+                "valu": [("-", v_tmp1[0], all_idx[vi], idx_base_vec),
+                         ("-", v_tmp1[1], all_idx[vi+1], idx_base_vec)]
+            })
+
+            # Level 1: mask1 based on bit 1
+            self.instrs.append({
+                "valu": [(">>", v_tmp1[2], v_tmp1[0], v_one),
+                         (">>", v_tmp1[3], v_tmp1[1], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2]),
+                         ("-", v_tmp1[3], v_zero, v_tmp1[3])]
+            })
+
+            # sel_low0 = n0 ^ (diff02 & mask1), sel_high0 = n1 ^ (diff13 & mask1)
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], diff02, v_tmp1[2]),
+                         ("&", v_tmp2[1], diff13, v_tmp1[2])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], v_node[0], v_tmp2[0]),
+                         ("^", v_tmp2[1], v_node[1], v_tmp2[1])]
+            })
+            # v_tmp2[0] = sel_low for vec vi, v_tmp2[1] = sel_high for vec vi
+
+            # Level 2 for vec vi: mask0 = 0 - (offset & 1)
+            self.instrs.append({
+                "valu": [("&", v_tmp1[2], v_tmp1[0], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[2], v_zero, v_tmp1[2])]
+            })
+            # final = sel_low ^ ((sel_low ^ sel_high) & mask0)
+            self.instrs.append({
+                "valu": [("^", v_tmp1[0], v_tmp2[0], v_tmp2[1])]  # diff
+            })
+            self.instrs.append({
+                "valu": [("&", v_tmp1[0], v_tmp1[0], v_tmp1[2])]  # masked
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp1[0], v_tmp2[0], v_tmp1[0])]  # final for vec vi
+            })
+
+            # Now do vec vi+1 - need to recalculate with its mask
+            self.instrs.append({
+                "valu": [("&", v_tmp2[0], diff02, v_tmp1[3]),
+                         ("&", v_tmp2[1], diff13, v_tmp1[3])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp2[0], v_node[0], v_tmp2[0]),
+                         ("^", v_tmp2[1], v_node[1], v_tmp2[1])]
+            })
+            self.instrs.append({
+                "valu": [("&", v_tmp1[3], v_tmp1[1], v_one)]
+            })
+            self.instrs.append({
+                "valu": [("-", v_tmp1[3], v_zero, v_tmp1[3])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp1[1], v_tmp2[0], v_tmp2[1])]
+            })
+            self.instrs.append({
+                "valu": [("&", v_tmp1[1], v_tmp1[1], v_tmp1[3])]
+            })
+            self.instrs.append({
+                "valu": [("^", v_tmp1[1], v_tmp2[0], v_tmp1[1])]  # final for vec vi+1
+            })
+
+            # XOR with val
+            self.instrs.append({
+                "valu": [("^", all_val[vi], all_val[vi], v_tmp1[0]),
+                         ("^", all_val[vi+1], all_val[vi+1], v_tmp1[1])]
+            })
 
         # Hash all vectors
         self._emit_hash_all(all_val, v_tmp1, v_tmp2, hash_const_vecs, n_vectors)
