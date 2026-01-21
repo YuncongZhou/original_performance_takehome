@@ -12,8 +12,9 @@ Achieve **< 1487 cycles** to beat Claude Opus 4.5's best performance at launch.
 - **1363 cycles**: Claude Opus 4.5 in an improved test time compute harness
 
 ## Current Status
-- **3514 cycles** - Current implementation
-- Need **2.36x improvement** to reach goal
+- **3394 cycles** - Current best implementation
+- Need **2.28x improvement** to reach goal
+- Speedup over baseline: **43.5x**
 
 ## Architecture Constraints
 - VLEN = 8 (vector width)
@@ -21,50 +22,52 @@ Achieve **< 1487 cycles** to beat Claude Opus 4.5's best performance at launch.
 - Scratch size: 1536 words (currently using 817)
 - Processing: 256 elements (32 vectors) through 16 rounds
 
-## Key Observations
-- VALU utilization: only 42.9% - lots of wasted VALU cycles
-- 3085 scalar loads needed, but spread across 3514 cycles
-- Theoretical minimum based on loads alone: ~800 cycles
-- Theoretical minimum based on VALU alone: ~1200 cycles
+## Key Observations (Updated)
+- Total loads: 3239 → minimum 1620 cycles (load-bound)
+- Total VALU ops: 8831 → minimum 1472 cycles
+- Current instruction breakdown:
+  - 649 load-only cycles (wasted VALU slots)
+  - 1589 VALU-only cycles (wasted load slots)
+  - 1020 overlapped cycles (good utilization)
+- To hit <1487 cycles: need <2974 loads (must reduce by 265+)
+
+## Optimizations Applied
+1. **Instruction merging** (100 pairs merged): 3514 → 3414 cycles
+2. **multiply_add for index update**: 3414 → 3394 cycles
+
+## Critical Insight
+To achieve <1487 cycles, we MUST:
+1. **Reduce loads** via k-selection for rounds 2-4, 13-15
+2. **Overlap k-selection VALU** with remaining full gather loads
+
+K-selection load savings potential:
+- k=4 (rounds 2,13): 504 loads saved
+- k=8 (rounds 3,14): 496 loads saved
+- k=16 (rounds 4,15): 480 loads saved
+- Total: 1480 loads saved → 1759 remaining → 880 load cycles
+
+Challenge: k-selection adds VALU overhead that must overlap with other work.
 
 ## Round Structure
-- Round 0, 11: k=1 (all at same index) - already optimized
-- Round 1, 12: k=2 (2 unique indices) - already optimized
-- Round 2, 13: k=4 (4 unique indices) - OPPORTUNITY
-- Round 3, 14: k=8 (8 unique indices) - OPPORTUNITY
-- Round 4, 15: k=16 (16 unique indices) - OPPORTUNITY
-- Rounds 5-10: Full gather (32+ unique) - need optimization
+- Round 0, 11: k=1 (all at idx=0) - already optimized
+- Round 1, 12: k=2 (indices 1-2) - already optimized
+- Round 2, 13: k=4 (indices 3-6) - k-selection candidate
+- Round 3, 14: k=8 (indices 7-14) - k-selection candidate
+- Round 4, 15: k=16 (indices 15-30) - k-selection candidate
+- Rounds 5-10: Full gather (32+ unique) - load-heavy
 
-## Reflection & Top 5 Ideas (Priority Order)
+## Next Steps (Priority Order)
 
-### 1. Wave-based Round Pipelining (HIGH PRIORITY)
-Process vectors in two waves (0-15, 16-31) staggered by one round:
-- While Wave A does gather (load-heavy) for round R
-- Wave B does hash/index (VALU-heavy) for round R-1
-- This overlaps the 57% wasted VALU with useful work
-- Potential: Could nearly halve total cycles if perfectly balanced
+### 1. Implement Vector-Level Pipelining
+Process vectors in staggered fashion:
+- Wave A (vectors 0-15) at round R
+- Wave B (vectors 16-31) at round R-1
+- Overlap Wave A's loads with Wave B's VALU
 
-### 2. Aggressive k-selection for rounds 2-4, 13-15
-Replace gather with VALU-based selection:
-- k=4: 4 loads + VALU select vs 128 loads - save ~100 cycles/round
-- k=8: 8 loads + VALU select vs 128 loads - save ~80 cycles/round
-- k=16: 16 loads + VALU select vs 128 loads - save ~50 cycles/round
-- Total potential savings: ~600 cycles
+### 2. K-selection with Proper Overlap
+- Load k nodes at round start
+- Broadcast to vectors
+- VALU-based selection fills slots during other operations
 
-### 3. Better VALU Packing During Full Gather
-Fill the 57% wasted VALU slots during gather loads:
-- During 8-cycle Gather A: 48 VALU slots available but unused
-- Could precompute hash constants, do address calculations
-- Incremental improvement: ~100-200 cycles
-
-### 4. Fused Multi-Round Processing for k-selection rounds
-Preload ALL node values for rounds 2,3,4 (28 values total):
-- Process rounds 2,3,4 back-to-back without returning to memory
-- Only need index updates (VALU) between rounds
-- Could save setup/teardown overhead
-
-### 5. Process 6 Vectors per Group (instead of 4)
-Better utilize ALU slots during address computation:
-- 6 vectors need 48 address ops, fitting in 4 ALU cycles
-- Reduces total groups from 8 to 6
-- May improve instruction density
+### 3. Global Instruction Scheduling
+Build dependency graph of all operations, then schedule to maximize slot utilization.
