@@ -88,9 +88,33 @@ All failed to make changes - analysis only:
 3. **Micro-tasks with exact code work better** than high-level descriptions
 4. **K-selection pre-caching is the right approach** - just need proper implementation
 
-## Next Steps If Current Batch Fails
+## Batch 4 (LOAD REDUCTION Focus - Running)
 
-1. Try even more specific prompts with line-by-line diffs
-2. Provide actual working code skeleton with TODOs
-3. Break into smaller micro-tasks (e.g., "just add the elif clause", then "just implement load", etc.)
-4. Consider implementing ourselves and having Claude iterate/optimize
+### Strategy: Reduce loads WITHOUT adding VALU overhead
+Problem: VALU utilization < 50%, memory-bound, k-selection added too much VALU work
+
+### Active Tasks:
+1. **scratch-cache-preload** (Target: < 3300)
+   - Pre-load 31 hot nodes into scratch at kernel start
+   - Rounds 0-4, 11-15 read from scratch (not memory)
+   - Expected: ~500 cycle reduction, ZERO VALU overhead
+
+2. **shared-load-broadcast** (Target: < 3350)
+   - Load each unique node ONCE per round
+   - Direct vbroadcast/copy to vectors (not complex selection)
+   - Expected: ~90 cycles saved, 1 VALU op per vector (cheap)
+
+3. **speculative-prefetch** (Target: < 3250, Stretch: < 2000)
+   - Load round N+1 data WHILE computing round N
+   - Overlap load latency with existing VALU work
+   - Expected: Hide most load latency, potentially transformative
+
+## Continuous Improvement Process
+
+1. Monitor running tasks (monitor_and_iterate.sh)
+2. When batch completes, analyze results:
+   - What worked? What didn't?
+   - What's the remaining bottleneck?
+3. Generate 3 new ideas targeting bottleneck
+4. Launch new batch
+5. Repeat until < 1487 cycles achieved
