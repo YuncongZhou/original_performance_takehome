@@ -104,6 +104,29 @@ All failed to make changes - analysis only:
 - Must save > 62 operations to break even
 - Need smarter caching: lazy load, not eager load
 
+## Batch 5 (ZERO-OVERHEAD + ARCHITECTURAL - Running)
+
+### Strategy: Apply learnings + architectural breakthrough
+
+**Key Insight:** Need approaches with ZERO added overhead OR architectural redesign
+
+### Active Tasks:
+1. **instruction-level-fusion** (Target: < 3300)
+   - Pack Load + VALU in same instruction cycles
+   - Zero overhead - just better scheduling
+   - Expected: 200 cycles saved
+
+2. **mega-kernel-waves** (Target: < 2500, Stretch: < 2000) 🌟
+   - Split 32 vectors into 4 waves
+   - Interleave waves across rounds for perfect pipeline
+   - Near-perfect slot utilization (>90%)
+   - THIS IS THE BREAKTHROUGH APPROACH
+
+3. **load-store-forwarding** (Target: < 3200)
+   - Use scratch as cache, forward values between rounds
+   - Avoid redundant forest loads
+   - Expected: 20-30% load reduction
+
 ## Batch 4 (LOAD REDUCTION Focus - Previous)
 
 ### Strategy: Reduce loads WITHOUT adding VALU overhead
