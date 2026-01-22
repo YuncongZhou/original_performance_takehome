@@ -1498,23 +1498,22 @@ class KernelBuilder:
                     v_count = min(3, vecs - v_off)
                     base = vi + v_off
                     if v_count == 3:
+                        # Use multiply_add to compute idx*2+1 in one op
+                        # temps: v_tmp1[0-2] for multiply_add results, v_tmp1[3], v_tmp2[0-1] for bits
+                        # Step 1: multiply_add(idx, 2, 1) for 0-2 and extract bits for all 3
                         self.instrs.append({
-                            "valu": [("&", v_tmp1[0], all_val[base], v_one),
-                                     ("*", all_idx[base], all_idx[base], v_two),
-                                     ("&", v_tmp1[1], all_val[base+1], v_one),
-                                     ("*", all_idx[base+1], all_idx[base+1], v_two),
-                                     ("&", v_tmp1[2], all_val[base+2], v_one),
-                                     ("*", all_idx[base+2], all_idx[base+2], v_two)]
+                            "valu": [("multiply_add", v_tmp1[0], all_idx[base], v_two, v_one),
+                                     ("multiply_add", v_tmp1[1], all_idx[base+1], v_two, v_one),
+                                     ("multiply_add", v_tmp1[2], all_idx[base+2], v_two, v_one),
+                                     ("&", v_tmp1[3], all_val[base], v_one),
+                                     ("&", v_tmp2[0], all_val[base+1], v_one),
+                                     ("&", v_tmp2[1], all_val[base+2], v_one)]
                         })
+                        # Step 2: Add bits to complete index calculation
                         self.instrs.append({
-                            "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
-                                     ("+", v_tmp1[1], v_tmp1[1], v_one),
-                                     ("+", v_tmp1[2], v_tmp1[2], v_one)]
-                        })
-                        self.instrs.append({
-                            "valu": [("+", all_idx[base], all_idx[base], v_tmp1[0]),
-                                     ("+", all_idx[base+1], all_idx[base+1], v_tmp1[1]),
-                                     ("+", all_idx[base+2], all_idx[base+2], v_tmp1[2])]
+                            "valu": [("+", all_idx[base], v_tmp1[0], v_tmp1[3]),
+                                     ("+", all_idx[base+1], v_tmp1[1], v_tmp2[0]),
+                                     ("+", all_idx[base+2], v_tmp1[2], v_tmp2[1])]
                         })
                         if not skip_wrap_check:
                             self.instrs.append({
@@ -2049,7 +2048,7 @@ def optimize_instructions(instrs):
         return True
 
     def can_add_valu_to_load(load_instr, valu_instr):
-        '''Check if VALU ops can be added to a load instruction'''
+        '''Check if VALU ops can be added to a load instruction (VALU after load)'''
         if 'valu' in load_instr:
             return False
         if 'load' not in load_instr:
@@ -2058,10 +2057,35 @@ def optimize_instructions(instrs):
             return False
         if len(valu_instr['valu']) > 6:
             return False
-        # Check that VALU doesn't read what load writes
+        # Check that VALU doesn't read what load writes (RAW hazard)
         load_writes = get_load_written_addrs(load_instr)
         valu_reads = get_valu_read_addrs(valu_instr)
         if load_writes & valu_reads:
+            return False
+        return True
+
+    def can_add_valu_before_load(valu_instr, load_instr):
+        '''Check if VALU ops can be merged with a following load instruction (VALU before load)'''
+        if 'valu' in load_instr:
+            return False
+        if 'load' not in load_instr:
+            return False
+        if set(valu_instr.keys()) != {'valu'}:
+            return False
+        if len(valu_instr['valu']) > 6:
+            return False
+        # Check that load doesn't read what VALU writes (no hazard in merged parallel execution)
+        # In merged instruction, all reads happen before all writes, so:
+        # - VALU reads old values (OK)
+        # - Load reads old values (need to check VALU doesn't write what load reads)
+        valu_writes = get_valu_written_addrs(valu_instr)
+        load_reads = set()
+        for op in load_instr.get('load', []):
+            if op[0] == 'load':
+                load_reads.add(op[2])  # Source address
+            elif op[0] == 'vload':
+                load_reads.add(op[2])
+        if valu_writes & load_reads:
             return False
         return True
 
@@ -2084,10 +2108,18 @@ def optimize_instructions(instrs):
                 merged_this_pass += 1
                 i += 2
                 merged = True
-            # Try to add VALU to load instruction
+            # Try to add VALU to load instruction (VALU after load)
             elif i + 1 < len(current) and can_add_valu_to_load(instr, current[i + 1]):
                 new_instr = dict(instr)
                 new_instr['valu'] = list(current[i + 1]['valu'])
+                optimized.append(new_instr)
+                merged_this_pass += 1
+                i += 2
+                merged = True
+            # Try to add VALU to load instruction (VALU before load)
+            elif i + 1 < len(current) and can_add_valu_before_load(instr, current[i + 1]):
+                new_instr = dict(current[i + 1])
+                new_instr['valu'] = list(instr['valu'])
                 optimized.append(new_instr)
                 merged_this_pass += 1
                 i += 2
