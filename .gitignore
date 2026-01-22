@@ -5,3 +5,9 @@ trace.json
 
 # Auto Claude data directory
 .auto-claude/
+
+# Parallel optimizer temporary files
+.optimization_results_*/
+.parallel_opt_state/
+parallel_opt.log
+*.bak
