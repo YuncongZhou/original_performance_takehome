@@ -1532,19 +1532,17 @@ class KernelBuilder:
                                          ("&", all_idx[base+2], all_idx[base+2], v_tmp1[2])]
                             })
                     elif v_count == 2:
+                        # Step 1: multiply_add(idx, 2, 1) and extract bits
                         self.instrs.append({
-                            "valu": [("&", v_tmp1[0], all_val[base], v_one),
-                                     ("*", all_idx[base], all_idx[base], v_two),
-                                     ("&", v_tmp1[1], all_val[base+1], v_one),
-                                     ("*", all_idx[base+1], all_idx[base+1], v_two)]
+                            "valu": [("multiply_add", v_tmp2[0], all_idx[base], v_two, v_one),
+                                     ("multiply_add", v_tmp2[1], all_idx[base+1], v_two, v_one),
+                                     ("&", all_idx[base], all_val[base], v_one),
+                                     ("&", all_idx[base+1], all_val[base+1], v_one)]
                         })
+                        # Step 2: Add bits to (idx*2+1)
                         self.instrs.append({
-                            "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
-                                     ("+", v_tmp1[1], v_tmp1[1], v_one)]
-                        })
-                        self.instrs.append({
-                            "valu": [("+", all_idx[base], all_idx[base], v_tmp1[0]),
-                                     ("+", all_idx[base+1], all_idx[base+1], v_tmp1[1])]
+                            "valu": [("+", all_idx[base], v_tmp2[0], all_idx[base]),
+                                     ("+", all_idx[base+1], v_tmp2[1], all_idx[base+1])]
                         })
                         if not skip_wrap_check:
                             self.instrs.append({
