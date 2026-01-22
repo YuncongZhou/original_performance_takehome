@@ -36,7 +36,7 @@ The benchmark is unforgiving. Meeting the **< 1487 cycles** threshold is our sol
 - **1363 cycles**: Claude Opus 4.5 in an improved test time compute harness
 
 ## Current Status
-- **3394 cycles** - Current best implementation
+- ** cycles** - Current best implementation
 - Need **2.28x improvement** to reach goal
 - Speedup over baseline: **43.5x**
 
