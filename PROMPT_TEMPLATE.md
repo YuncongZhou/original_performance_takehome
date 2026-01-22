@@ -1,6 +1,17 @@
 # Prompt Template for Parallel Optimizer
 
-When creating optimization prompts for Claude Opus 4.5, include ALL of these sections:
+## CRITICAL MINDSET (Include in EVERY prompt):
+
+**NO CAUTION NEEDED**: This is NOT production code. Our ONLY goal is to decrease cycle count. Everything is on the table:
+- Break code style conventions
+- Use hacky solutions
+- Try extreme approaches
+- Make code unreadable if it's faster
+- Take risks - we can always revert
+
+The simulator is our judge. If tests pass and cycles decrease, the code is GOOD.
+
+## Sections to Include:
 
 ## 1. GOAL & METRICS
 - Target cycle count
