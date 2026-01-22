@@ -1586,15 +1586,14 @@ class KernelBuilder:
                                      ("&", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
                         })
                 else:  # vecs == 1
+                    # Step 1: multiply_add(idx, 2, 1) and & for bit
                     self.instrs.append({
-                        "valu": [("&", v_tmp1[0], all_val[vi], v_one),
-                                 ("*", all_idx[vi], all_idx[vi], v_two)]
+                        "valu": [("multiply_add", v_tmp1[0], all_idx[vi], v_two, v_one),
+                                 ("&", all_idx[vi], all_val[vi], v_one)]
                     })
+                    # Step 2: + to combine shifted idx with bit
                     self.instrs.append({
-                        "valu": [("+", v_tmp1[0], v_tmp1[0], v_one)]
-                    })
-                    self.instrs.append({
-                        "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0])]
+                        "valu": [("+", all_idx[vi], v_tmp1[0], all_idx[vi])]
                     })
                     if not skip_wrap_check:
                         self.instrs.append({
