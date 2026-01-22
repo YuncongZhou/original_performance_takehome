@@ -1560,16 +1560,14 @@ class KernelBuilder:
             else:
                 # 1-2 vectors
                 if vecs == 2:
+                    # Step 1: multiply_add(idx, 2, 1) and extract bits
                     self.instrs.append({
-                        "valu": [("&", v_tmp1[0], all_val[vi], v_one),
-                                 ("*", all_idx[vi], all_idx[vi], v_two),
-                                 ("&", v_tmp1[1], all_val[vi+1], v_one),
-                                 ("*", all_idx[vi+1], all_idx[vi+1], v_two)]
+                        "valu": [("multiply_add", all_idx[vi], all_idx[vi], v_two, v_one),
+                                 ("multiply_add", all_idx[vi+1], all_idx[vi+1], v_two, v_one),
+                                 ("&", v_tmp1[0], all_val[vi], v_one),
+                                 ("&", v_tmp1[1], all_val[vi+1], v_one)]
                     })
-                    self.instrs.append({
-                        "valu": [("+", v_tmp1[0], v_tmp1[0], v_one),
-                                 ("+", v_tmp1[1], v_tmp1[1], v_one)]
-                    })
+                    # Step 2: Add bits to (idx*2+1)
                     self.instrs.append({
                         "valu": [("+", all_idx[vi], all_idx[vi], v_tmp1[0]),
                                  ("+", all_idx[vi+1], all_idx[vi+1], v_tmp1[1])]
