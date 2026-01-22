@@ -162,13 +162,16 @@ class KernelBuilder:
             # All other rounds stay within bounds (levels 0-10 have indices 0-2046)
             needs_wrap_check = (round_num == 10)
 
+            # For round 10, ALL indices wrap to 0, so we can skip computation and directly zero them
+            force_zero_index = (round_num == 10)
+
             if effective_round == 0:
                 # k=1: all indices at 0 (rounds 0 and 11)
                 self._emit_round_single_idx(
                     all_idx, all_val, v_node, v_tmp1, v_tmp2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                     n_vectors, tmp1, idx_value=0, skip_index=is_last_round,
-                    skip_wrap_check=not needs_wrap_check
+                    skip_wrap_check=not needs_wrap_check, force_zero_index=force_zero_index
                 )
             elif effective_round == 1:
                 # k=2: indices in {1, 2} (rounds 1 and 12)
@@ -176,7 +179,7 @@ class KernelBuilder:
                     all_idx, all_val, v_node, v_tmp1, v_tmp2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                     n_vectors, tmp1, tmp2, idx_base=1, skip_index=is_last_round,
-                    skip_wrap_check=not needs_wrap_check
+                    skip_wrap_check=not needs_wrap_check, force_zero_index=force_zero_index
                 )
             else:
                 # Full gather for all rounds with 4+ unique indices
@@ -185,7 +188,7 @@ class KernelBuilder:
                     all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                     hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
                     n_vectors, tmp1, skip_index=is_last_round,
-                    skip_wrap_check=not needs_wrap_check
+                    skip_wrap_check=not needs_wrap_check, force_zero_index=force_zero_index
                 )
 
         # ============ STORE ALL VALUES ============
@@ -198,7 +201,7 @@ class KernelBuilder:
 
     def _emit_round_single_idx(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                                 hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                                n_vectors, tmp1, idx_value, skip_index=False, skip_wrap_check=False):
+                                n_vectors, tmp1, idx_value, skip_index=False, skip_wrap_check=False, force_zero_index=False):
         """Emit round with single unique index (rounds 0 and 11)."""
         # Load single node value
         self.add("load", ("load", tmp1, self.scratch["forest_values_p"]))
@@ -217,11 +220,11 @@ class KernelBuilder:
         # Index update all vectors (skip for last round)
         if not skip_index:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2, force_zero_index=force_zero_index)
 
     def _emit_round_k2(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                        hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                       n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False):
+                       n_vectors, tmp1, tmp2, idx_base, skip_index=False, skip_wrap_check=False, force_zero_index=False):
         """Emit round with k=2 unique indices using VALU-based conditional select.
         Optimized: process 4 vectors at a time using 4 VALU slots."""
         # Load 2 node values: forest[idx_base] and forest[idx_base+1]
@@ -291,7 +294,7 @@ class KernelBuilder:
         # Index update all vectors (skip for last round)
         if not skip_index:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2, force_zero_index=force_zero_index)
 
     def _emit_round_k4_fast(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                             hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
@@ -638,7 +641,7 @@ class KernelBuilder:
         # Index update all vectors (skip for last round)
         if not skip_index:
             self._emit_index_all(all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2)
+                                 skip_wrap_check=skip_wrap_check, v_tmp2=v_tmp2, force_zero_index=force_zero_index)
 
     def _emit_round_k4_optimized_v2(self, all_idx, all_val, v_node, v_tmp1, v_tmp2,
                                      hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
@@ -1439,15 +1442,26 @@ class KernelBuilder:
                             })
 
     def _emit_index_all(self, all_idx, all_val, v_tmp1, v_one, v_two, v_n_nodes, v_zero, n_vectors,
-                         skip_wrap_check=False, v_tmp2=None):
+                         skip_wrap_check=False, v_tmp2=None, force_zero_index=False):
         """Index update all vectors, 6 at a time for better VALU utilization.
 
         skip_wrap_check: If True, skip the comparison and masking (saves 3 instructions per group).
                         Use this for rounds where idx is guaranteed to stay < n_nodes.
+        force_zero_index: If True, unconditionally set all indices to 0 (for round 10 optimization).
+                         Saves all index computation operations.
 
         Optimized formula: new_idx = old_idx * 2 + 1 + (val & 1)
         Using multiply_add: tmp = multiply_add(idx, 2, 1) = idx*2+1, then tmp + (val&1)
         """
+        # For round 10, all indices wrap to 0, so directly assign without computation
+        if force_zero_index:
+            for vi in range(0, n_vectors, 6):
+                vecs = min(6, n_vectors - vi)
+                self.instrs.append({
+                    "valu": [("&", all_idx[vi+j], v_zero, v_zero) for j in range(vecs)]
+                })
+            return
+
         # new_idx = old_idx * 2 + (val & 1) + 1 = multiply_add(idx, 2, 1) + (val & 1)
         # if new_idx >= n_nodes: new_idx = 0
         for vi in range(0, n_vectors, 6):
@@ -1614,7 +1628,7 @@ class KernelBuilder:
 
     def _emit_round_full_gather(self, all_idx, all_val, v_node, v_tmp1, v_tmp2, v_addrs, v_addrs2,
                                  hash_const_vecs, v_one, v_two, v_n_nodes, v_zero,
-                                 n_vectors, tmp1, skip_index=False, skip_wrap_check=False):
+                                 n_vectors, tmp1, skip_index=False, skip_wrap_check=False, force_zero_index=False):
         """Full gather round with pipelining - overlaps Index B with next group's address computation."""
         n_groups = n_vectors // 4  # 8 groups
         fp = self.scratch["forest_values_p"]
