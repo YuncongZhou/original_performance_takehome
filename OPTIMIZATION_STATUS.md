@@ -88,7 +88,23 @@ All failed to make changes - analysis only:
 3. **Micro-tasks with exact code work better** than high-level descriptions
 4. **K-selection pre-caching is the right approach** - just need proper implementation
 
-## Batch 4 (LOAD REDUCTION Focus - Running)
+## Batch 4 (LOAD REDUCTION Focus - Results)
+
+### Results:
+- ❌ **scratch-cache-v2**: 3600 cycles (REGRESSION - worse than baseline!)
+  - Implemented caching but added too much overhead (31 loads + 31 broadcasts upfront)
+  - Conditional logic had bugs (fallthrough to original loads)
+  - Net effect: +110 cycles instead of -500
+- ⏳ **shared-load-broadcast**: Still running, no output yet
+- ⏳ **speculative-prefetch**: Still running, no changes made yet
+- ⏳ **mega-kernel-fusion-v2**: Just started, no changes yet
+
+### Learning: Pre-loading has overhead!
+- 31 loads + 31 broadcasts = 62 operations upfront
+- Must save > 62 operations to break even
+- Need smarter caching: lazy load, not eager load
+
+## Batch 4 (LOAD REDUCTION Focus - Previous)
 
 ### Strategy: Reduce loads WITHOUT adding VALU overhead
 Problem: VALU utilization < 50%, memory-bound, k-selection added too much VALU work
