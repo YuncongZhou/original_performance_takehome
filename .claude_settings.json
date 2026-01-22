@@ -1,0 +1,34 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read(./**)",
+      "Write(./**)",
+      "Edit(./**)",
+      "Glob(./**)",
+      "Grep(./**)",
+      "Read(/Users/alexzhou/github/original_performance_takehome/**)",
+      "Write(/Users/alexzhou/github/original_performance_takehome/**)",
+      "Edit(/Users/alexzhou/github/original_performance_takehome/**)",
+      "Glob(/Users/alexzhou/github/original_performance_takehome/**)",
+      "Grep(/Users/alexzhou/github/original_performance_takehome/**)",
+      "Read(/Users/alexzhou/github/original_performance_takehome/.auto-claude/specs/017-implement-mega-kernel-fusion-strategy/**)",
+      "Write(/Users/alexzhou/github/original_performance_takehome/.auto-claude/specs/017-implement-mega-kernel-fusion-strategy/**)",
+      "Edit(/Users/alexzhou/github/original_performance_takehome/.auto-claude/specs/017-implement-mega-kernel-fusion-strategy/**)",
+      "Bash(*)",
+      "WebFetch(*)",
+      "WebSearch(*)",
+      "mcp__context7__resolve-library-id(*)",
+      "mcp__context7__get-library-docs(*)",
+      "mcp__graphiti-memory__search_nodes(*)",
+      "mcp__graphiti-memory__search_facts(*)",
+      "mcp__graphiti-memory__add_episode(*)",
+      "mcp__graphiti-memory__get_episodes(*)",
+      "mcp__graphiti-memory__get_entity_edge(*)"
+    ]
+  }
+}

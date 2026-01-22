@@ -1,0 +1,25 @@
+{
+  "active": true,
+  "spec": "005-reduce-wrap-check-overhead-with-speculative-execut",
+  "state": "building",
+  "subtasks": {
+    "completed": 2,
+    "total": 3,
+    "in_progress": 1,
+    "failed": 0
+  },
+  "phase": {
+    "current": "Alternative: Speculative Execution Approach",
+    "id": null,
+    "total": 1
+  },
+  "workers": {
+    "active": 0,
+    "max": 1
+  },
+  "session": {
+    "number": 4,
+    "started_at": "2026-01-21T17:09:40.962566"
+  },
+  "last_update": "2026-01-21T17:28:50.350606"
+}
