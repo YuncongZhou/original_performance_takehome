@@ -1,6 +1,19 @@
 """
 Optimized kernel with index deduplication.
 
+# Task
+
+- Optimize the kernel (in KernelBuilder.build_kernel) as much as possible in the
+  available time, as measured by test_kernel_cycles on a frozen separate copy
+  of the simulator.
+
+Validate your results using `python tests/submission_tests.py` without modifying
+anything in the tests/ folder.
+
+We recommend you look through problem.py next.
+
+# Optimization Notes
+
 Key insight: Tree traversal has DETERMINISTIC index patterns:
 - Round 0: All at idx=0 (1 unique)
 - Round 10: ALL wrap back to idx=0! (children of level 9 all >= 1023)

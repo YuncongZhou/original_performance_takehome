@@ -21,3 +21,19 @@ Measured in clock cycles from the simulated machine. All of these numbers are fo
 While it's no longer a good time-limited test, you can still use this test to get us excited about hiring you! If you optimize below 1487 cycles, beating Claude Opus 4.5's best performance at launch, email us at performance-recruiting@anthropic.com with your code (and ideally a resume) so we can be appropriately impressed, especially if you get near the best solution we've seen. New model releases may change what threshold impresses us though, and no guarantees that we keep this readme updated with the latest on that.
 
 Run `python tests/submission_tests.py` to see which thresholds you pass.
+
+## Warning: LLMs can cheat
+
+None of the solutions we received on the first day post-release below 1300 cycles were valid solutions. In each case, a language model modified the tests to make the problem easier.
+
+If you use an AI agent, we recommend instructing it not to change the `tests/` folder and to use `tests/submission_tests.py` for verification.
+
+Please run the following commands to validate your submission, and mention that you did so when submitting:
+```
+# This should be empty, the tests folder must be unchanged
+git diff origin/main tests/
+# You should pass some of these tests and use the cycle count this prints
+python tests/submission_tests.py
+```
+
+An example of this kind of hack is a model noticing that `problem.py` has multicore support, implementing multicore as an optimization, noticing there's no speedup and "debugging" that `N_CORES = 1` and "fixing" the core count so they get a speedup. Multicore is disabled intentionally in this version.
