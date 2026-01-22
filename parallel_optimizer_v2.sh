@@ -92,8 +92,8 @@ add_approach() {
     (
         cd "$worktree_path"
 
-        # Run optimization
-        $TIMEOUT_CMD ${TIMEOUT_MINUTES}m claude -p "$prompt" > "${approach_dir}/output.txt" 2>&1
+        # Run optimization with dangerous skip permissions for autonomous operation
+        $TIMEOUT_CMD ${TIMEOUT_MINUTES}m claude --dangerously-skip-permissions -p "$prompt" > "${approach_dir}/output.txt" 2>&1
         exit_code=$?
 
         echo "Exit code: $exit_code" >> "${approach_dir}/output.txt"
