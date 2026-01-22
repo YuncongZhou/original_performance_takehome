@@ -1,5 +1,16 @@
 # Performance Optimization Notes
 
+## CRITICAL RULE: NEVER MODIFY TESTS
+⚠️ **DO NOT modify anything in the `tests/` folder under ANY circumstances.**
+
+This is a strict requirement for valid submissions. Any modification to test files is considered cheating and will invalidate the solution.
+
+Verify test integrity before submission:
+```bash
+git diff upstream/main tests/  # Should be empty
+python tests/submission_tests.py  # Use this for verification
+```
+
 ## Goal
 Achieve **< 1487 cycles** to beat Claude Opus 4.5's best performance at launch.
 
