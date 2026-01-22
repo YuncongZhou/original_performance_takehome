@@ -14,6 +14,19 @@ python tests/submission_tests.py  # Use this for verification
 ## Goal
 Achieve **< 1487 cycles** to beat Claude Opus 4.5's best performance at launch.
 
+## Optimization Philosophy
+**SINGULAR FOCUS: Cycle count is the ONLY metric that matters.**
+
+When making changes or reviewing code:
+- ✅ **DO** prioritize any optimization that reduces cycles, no matter how small
+- ✅ **DO** sacrifice code readability, maintainability, or elegance for performance
+- ✅ **DO** use aggressive techniques (unrolling, inlining, manual scheduling)
+- ❌ **DON'T** worry about code style, comments, or best practices
+- ❌ **DON'T** refactor for readability unless it also improves performance
+- ❌ **DON'T** spend time on anything that doesn't directly reduce cycle count
+
+The benchmark is unforgiving. Meeting the **< 1487 cycles** threshold is our sole objective.
+
 ## Published Benchmarks (Source of Truth)
 - **2164 cycles**: Claude Opus 4 after many hours in the test-time compute harness
 - **1790 cycles**: Claude Opus 4.5 in a casual Claude Code session, approximately matching the best human performance in 2 hours
